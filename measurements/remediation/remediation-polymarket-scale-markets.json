@@ -1,0 +1,608 @@
+{
+  "schema_version": 1,
+  "generated_at_us": 1792790586799394,
+  "exchange": "polymarket",
+  "count": 60,
+  "markets": [
+    {
+      "exchange": "polymarket",
+      "native_symbol": "54533043819946592547517511176940999955633860128497669742211153063842200957669",
+      "symbol": "polymarket:0x0f49db97f71c68b1e42a6d16e3de93d85dbf7d4148e3f018eb79e88554be9f75:0",
+      "title": "Will Gavin Newsom win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0x0f49db97f71c68b1e42a6d16e3de93d85dbf7d4148e3f018eb79e88554be9f75",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "87854174148074652060467921081181402357467303721471806610111179101805869578687",
+      "symbol": "polymarket:0x0f49db97f71c68b1e42a6d16e3de93d85dbf7d4148e3f018eb79e88554be9f75:1",
+      "title": "Will Gavin Newsom win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0x0f49db97f71c68b1e42a6d16e3de93d85dbf7d4148e3f018eb79e88554be9f75",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "50887272939612765629559172143901565817521391945540156085421963433918821328137",
+      "symbol": "polymarket:0x1970bcce75e3674660917ae4685b433a9b1e0152d810a8d7c346dfd5e00694c2:0",
+      "title": "Will Cory Booker win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0x1970bcce75e3674660917ae4685b433a9b1e0152d810a8d7c346dfd5e00694c2",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "29006371059590547574472177233842141554614007974283936149779962779213443973844",
+      "symbol": "polymarket:0x1970bcce75e3674660917ae4685b433a9b1e0152d810a8d7c346dfd5e00694c2:1",
+      "title": "Will Cory Booker win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0x1970bcce75e3674660917ae4685b433a9b1e0152d810a8d7c346dfd5e00694c2",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "26468656392978559668331516709623917078428425933265692717836103090220693717685",
+      "symbol": "polymarket:0x1d519b87999e3d4e90e1e8f57b5eee73a0ba488ff3fdb70867f294733aba84a9:0",
+      "title": "Will Andy Beshear win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0x1d519b87999e3d4e90e1e8f57b5eee73a0ba488ff3fdb70867f294733aba84a9",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "26335362363448644358593284423242327477307616743233875606762153873424287882825",
+      "symbol": "polymarket:0x1d519b87999e3d4e90e1e8f57b5eee73a0ba488ff3fdb70867f294733aba84a9:1",
+      "title": "Will Andy Beshear win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0x1d519b87999e3d4e90e1e8f57b5eee73a0ba488ff3fdb70867f294733aba84a9",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "81633484456710374417231462107666791993850637546563366185897100962157481970040",
+      "symbol": "polymarket:0x29283b56d3eec6d1d89fff51793d9d2e01579d2379b1d3e9ebda175d3561e809:0",
+      "title": "Will Phil Murphy win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0x29283b56d3eec6d1d89fff51793d9d2e01579d2379b1d3e9ebda175d3561e809",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "114507466536734360808195115190160357255467689128176113085692265197019898971527",
+      "symbol": "polymarket:0x29283b56d3eec6d1d89fff51793d9d2e01579d2379b1d3e9ebda175d3561e809:1",
+      "title": "Will Phil Murphy win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0x29283b56d3eec6d1d89fff51793d9d2e01579d2379b1d3e9ebda175d3561e809",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "113510300123120868861281132282742729065975487298059944817273881893086209196585",
+      "symbol": "polymarket:0x30cfb887558b20373a984da60c372fe5a90c0296aa6d8bb413a8aa7543846da2:0",
+      "title": "Will Bernie Sanders win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0x30cfb887558b20373a984da60c372fe5a90c0296aa6d8bb413a8aa7543846da2",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "3444964147133304300560138317203877470064591148213906708394693248804691192318",
+      "symbol": "polymarket:0x30cfb887558b20373a984da60c372fe5a90c0296aa6d8bb413a8aa7543846da2:1",
+      "title": "Will Bernie Sanders win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0x30cfb887558b20373a984da60c372fe5a90c0296aa6d8bb413a8aa7543846da2",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "104464678880204778606895232389511543522030897731392516718349574106843434770446",
+      "symbol": "polymarket:0x3265b10daeb30dbcc3214bd02e488551d0a5d3028392f4152e4750b943fbfc91:0",
+      "title": "Will Tim Walz win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0x3265b10daeb30dbcc3214bd02e488551d0a5d3028392f4152e4750b943fbfc91",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "90935594925886073322524509252821043048115343298080885997215308777385571383769",
+      "symbol": "polymarket:0x3265b10daeb30dbcc3214bd02e488551d0a5d3028392f4152e4750b943fbfc91:1",
+      "title": "Will Tim Walz win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0x3265b10daeb30dbcc3214bd02e488551d0a5d3028392f4152e4750b943fbfc91",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "19323997520040734631220675039559156784534982703459512097490198935565229528445",
+      "symbol": "polymarket:0x3535fb2f4aef6619dde8b367cb5e5d209526bb496d5d9778428c58a0252435e3:0",
+      "title": "Will Zohran Mamdani win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0x3535fb2f4aef6619dde8b367cb5e5d209526bb496d5d9778428c58a0252435e3",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "111309365336519526711604102518316708823622751854213281307404397618571408959194",
+      "symbol": "polymarket:0x3535fb2f4aef6619dde8b367cb5e5d209526bb496d5d9778428c58a0252435e3:1",
+      "title": "Will Zohran Mamdani win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0x3535fb2f4aef6619dde8b367cb5e5d209526bb496d5d9778428c58a0252435e3",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "92325249719485031139867422012514654102580961954747753469470405147070256604118",
+      "symbol": "polymarket:0x36db77c539bcc8c7bf0686c1b99f30c5a5eed1f53d3b3a27a071550c81f83701:0",
+      "title": "Will Mark Kelly win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0x36db77c539bcc8c7bf0686c1b99f30c5a5eed1f53d3b3a27a071550c81f83701",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "5116999494213083595175041146469973274436003044730013359502912125889113751080",
+      "symbol": "polymarket:0x36db77c539bcc8c7bf0686c1b99f30c5a5eed1f53d3b3a27a071550c81f83701:1",
+      "title": "Will Mark Kelly win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0x36db77c539bcc8c7bf0686c1b99f30c5a5eed1f53d3b3a27a071550c81f83701",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "10521981432803570450946212503203364998108630328528216082760514453664705157397",
+      "symbol": "polymarket:0x3dc47a72ac6bb265e9cefebd2a2eeed00966394cb2d07245b5c94138b60e82a3:0",
+      "title": "Will Rahm Emanuel win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0x3dc47a72ac6bb265e9cefebd2a2eeed00966394cb2d07245b5c94138b60e82a3",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "91949042216127305292438280992722171735754548787382833799906976841509942727662",
+      "symbol": "polymarket:0x3dc47a72ac6bb265e9cefebd2a2eeed00966394cb2d07245b5c94138b60e82a3:1",
+      "title": "Will Rahm Emanuel win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0x3dc47a72ac6bb265e9cefebd2a2eeed00966394cb2d07245b5c94138b60e82a3",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "83723134981785004242996949681785273460678873813693556756054904164484296299719",
+      "symbol": "polymarket:0x3e218c99a1335641b3a5ee6c887521d19b0c28fddd6b99c254a07968e35c0b1b:0",
+      "title": "Will Michelle Obama win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0x3e218c99a1335641b3a5ee6c887521d19b0c28fddd6b99c254a07968e35c0b1b",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "107146110974011455665373243296921398136854344089489911087344946921091914123046",
+      "symbol": "polymarket:0x3e218c99a1335641b3a5ee6c887521d19b0c28fddd6b99c254a07968e35c0b1b:1",
+      "title": "Will Michelle Obama win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0x3e218c99a1335641b3a5ee6c887521d19b0c28fddd6b99c254a07968e35c0b1b",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "41340056280794024415573839406074658402877379128871144681466050648033201160259",
+      "symbol": "polymarket:0x46dbd48d6bde5b81edb480e0f676a2cdda6c6b592c4d86a9367c7ad5a9870195:0",
+      "title": "Will Liz Cheney win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0x46dbd48d6bde5b81edb480e0f676a2cdda6c6b592c4d86a9367c7ad5a9870195",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "63802361760137863513735993346883582181207639895442036953936089060482564982249",
+      "symbol": "polymarket:0x46dbd48d6bde5b81edb480e0f676a2cdda6c6b592c4d86a9367c7ad5a9870195:1",
+      "title": "Will Liz Cheney win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0x46dbd48d6bde5b81edb480e0f676a2cdda6c6b592c4d86a9367c7ad5a9870195",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "91031279171981959197361710127213577102576826515163085396576756946418341946256",
+      "symbol": "polymarket:0x4c325469d9b516ef4e6b8f73a81a12607dec075e3c2fd454f91765aaeafc4760:0",
+      "title": "Will Pete Buttigieg win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0x4c325469d9b516ef4e6b8f73a81a12607dec075e3c2fd454f91765aaeafc4760",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "18494065527924073750217237765784380365430319396356251245973222791140100738948",
+      "symbol": "polymarket:0x4c325469d9b516ef4e6b8f73a81a12607dec075e3c2fd454f91765aaeafc4760:1",
+      "title": "Will Pete Buttigieg win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0x4c325469d9b516ef4e6b8f73a81a12607dec075e3c2fd454f91765aaeafc4760",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "90227223115596293448966158151606153337847900483048338623540402385929720677904",
+      "symbol": "polymarket:0x61d9486c0f7e14ed98f3b177b6adcb3cd45646c92e8bbfbf209789b86472d4b6:0",
+      "title": "Will Wes Moore win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0x61d9486c0f7e14ed98f3b177b6adcb3cd45646c92e8bbfbf209789b86472d4b6",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "105134691322323565615831879054043168027913414000042547943201361115853277749482",
+      "symbol": "polymarket:0x61d9486c0f7e14ed98f3b177b6adcb3cd45646c92e8bbfbf209789b86472d4b6:1",
+      "title": "Will Wes Moore win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0x61d9486c0f7e14ed98f3b177b6adcb3cd45646c92e8bbfbf209789b86472d4b6",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "6349038249650226718426900942104344803413105653564595362433352811865798195800",
+      "symbol": "polymarket:0x663b88d3a8f2341bb8d878709dc78632bcaf7512e577bd15521e5d8ed933efbc:0",
+      "title": "Will Hillary Clinton win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0x663b88d3a8f2341bb8d878709dc78632bcaf7512e577bd15521e5d8ed933efbc",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "57931882677606943294773135604094039468334392354204920135953322654005083822055",
+      "symbol": "polymarket:0x663b88d3a8f2341bb8d878709dc78632bcaf7512e577bd15521e5d8ed933efbc:1",
+      "title": "Will Hillary Clinton win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0x663b88d3a8f2341bb8d878709dc78632bcaf7512e577bd15521e5d8ed933efbc",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "70071592420137476676935286377781779672157004436137616627487590484756055232944",
+      "symbol": "polymarket:0x74dba1ce1ae9dd535414e85f2d9ab5ea32c0fb1acc9b7130b67e6d91217e24e1:0",
+      "title": "Will Jon Ossoff win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0x74dba1ce1ae9dd535414e85f2d9ab5ea32c0fb1acc9b7130b67e6d91217e24e1",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "107829893465244243112531790315844862173967342141753896250561816305880797209350",
+      "symbol": "polymarket:0x74dba1ce1ae9dd535414e85f2d9ab5ea32c0fb1acc9b7130b67e6d91217e24e1:1",
+      "title": "Will Jon Ossoff win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0x74dba1ce1ae9dd535414e85f2d9ab5ea32c0fb1acc9b7130b67e6d91217e24e1",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "88927218779847397120407909832537568114340511586397698395193736044476021744522",
+      "symbol": "polymarket:0x88d67705780a3d922317ecb0c78a947a306174d0510df2ae89394d5abfb28206:0",
+      "title": "Will Barack Obama win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0x88d67705780a3d922317ecb0c78a947a306174d0510df2ae89394d5abfb28206",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "93993883668914241189795812807312922412111034935516092303580333564217329905759",
+      "symbol": "polymarket:0x88d67705780a3d922317ecb0c78a947a306174d0510df2ae89394d5abfb28206:1",
+      "title": "Will Barack Obama win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0x88d67705780a3d922317ecb0c78a947a306174d0510df2ae89394d5abfb28206",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "42119164854283656238382173699154739480090965550328051492328192273011556335098",
+      "symbol": "polymarket:0x8fbcb151e2c988df5a43abb02298014b7daf34c008f3eed9188dd16a2a19bec1:0",
+      "title": "Will Jared Polis win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0x8fbcb151e2c988df5a43abb02298014b7daf34c008f3eed9188dd16a2a19bec1",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "39150381508679235943386404690610035044747196600759141560840372170757042543675",
+      "symbol": "polymarket:0x8fbcb151e2c988df5a43abb02298014b7daf34c008f3eed9188dd16a2a19bec1:1",
+      "title": "Will Jared Polis win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0x8fbcb151e2c988df5a43abb02298014b7daf34c008f3eed9188dd16a2a19bec1",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "38171024903091354977195167437673496224420673639143973968032407064172828043588",
+      "symbol": "polymarket:0x909659c9436228e2be56d5582ba6188166f2f8bf3c596335512c8f2e380d01ec:0",
+      "title": "Will Kamala Harris win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0x909659c9436228e2be56d5582ba6188166f2f8bf3c596335512c8f2e380d01ec",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "26930844951471612827925270830087046333229637930899178134435055616497220846773",
+      "symbol": "polymarket:0x909659c9436228e2be56d5582ba6188166f2f8bf3c596335512c8f2e380d01ec:1",
+      "title": "Will Kamala Harris win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0x909659c9436228e2be56d5582ba6188166f2f8bf3c596335512c8f2e380d01ec",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "30732552320006664177902085971957467957450485111214036633872573588757974348601",
+      "symbol": "polymarket:0x939eeb2dea216749bd409bedde483c3f2bfb0e24d4f2d34461c0b21c6e91f010:0",
+      "title": "Will Roy Cooper win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0x939eeb2dea216749bd409bedde483c3f2bfb0e24d4f2d34461c0b21c6e91f010",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "55053374667733007627913689484290555932799177921000957543346276204775142445823",
+      "symbol": "polymarket:0x939eeb2dea216749bd409bedde483c3f2bfb0e24d4f2d34461c0b21c6e91f010:1",
+      "title": "Will Roy Cooper win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0x939eeb2dea216749bd409bedde483c3f2bfb0e24d4f2d34461c0b21c6e91f010",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "58378309871183461257693288827678410871907006920578755035402846056315798427503",
+      "symbol": "polymarket:0x9d4f94f82de9d13ff1d3318639ab9000ee2533949e525343156f374fb00bd9b1:0",
+      "title": "Will Mark Cuban win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0x9d4f94f82de9d13ff1d3318639ab9000ee2533949e525343156f374fb00bd9b1",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "55392527126713018429304496836617506663024188480522297953714346140749923557790",
+      "symbol": "polymarket:0x9d4f94f82de9d13ff1d3318639ab9000ee2533949e525343156f374fb00bd9b1:1",
+      "title": "Will Mark Cuban win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0x9d4f94f82de9d13ff1d3318639ab9000ee2533949e525343156f374fb00bd9b1",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "32338220190071351435772801779725302244575775216413325951443816017994629993401",
+      "symbol": "polymarket:0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7:0",
+      "title": "Xi Jinping out before 2027?",
+      "outcome": "Yes",
+      "exchange_market_id": "0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7",
+      "close_time_us": 1798779540000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "25659310674993675562345759665114759892400026242514633218387667107987341231962",
+      "symbol": "polymarket:0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7:1",
+      "title": "Xi Jinping out before 2027?",
+      "outcome": "No",
+      "exchange_market_id": "0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7",
+      "close_time_us": 1798779540000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "60590045489347122735554346200880179420435533609307820342798544098823516727807",
+      "symbol": "polymarket:0xc8f1cf5d4f26e0fd9c8fe89f2a7b3263b902cf14fde7bfccef525753bb492e47:0",
+      "title": "Will Stephen A. Smith win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0xc8f1cf5d4f26e0fd9c8fe89f2a7b3263b902cf14fde7bfccef525753bb492e47",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "76005700027045000587004110133818166617024719626220722682005164003117993034812",
+      "symbol": "polymarket:0xc8f1cf5d4f26e0fd9c8fe89f2a7b3263b902cf14fde7bfccef525753bb492e47:1",
+      "title": "Will Stephen A. Smith win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0xc8f1cf5d4f26e0fd9c8fe89f2a7b3263b902cf14fde7bfccef525753bb492e47",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "71289010523270989807437428651002770360280908813019627976988032260868574107425",
+      "symbol": "polymarket:0xca1d1139b0c3a29983407f499476ae642482788e841a277eb86faeeb9fa4a85c:0",
+      "title": "Will John Fetterman win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0xca1d1139b0c3a29983407f499476ae642482788e841a277eb86faeeb9fa4a85c",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "68686505966910102763700888296813272792512562699674656659355148432859571994559",
+      "symbol": "polymarket:0xca1d1139b0c3a29983407f499476ae642482788e841a277eb86faeeb9fa4a85c:1",
+      "title": "Will John Fetterman win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0xca1d1139b0c3a29983407f499476ae642482788e841a277eb86faeeb9fa4a85c",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "35165603539035270209469650915267170915291414186795231160733227083640059691764",
+      "symbol": "polymarket:0xcb239105ed21a2420ba4d85090b9bc32755c56601ffdc528afd17fd6282fe930:0",
+      "title": "Will Gina Raimondo win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0xcb239105ed21a2420ba4d85090b9bc32755c56601ffdc528afd17fd6282fe930",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "82254794773423437491598574581796732934760602553828664932786984448280136473130",
+      "symbol": "polymarket:0xcb239105ed21a2420ba4d85090b9bc32755c56601ffdc528afd17fd6282fe930:1",
+      "title": "Will Gina Raimondo win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0xcb239105ed21a2420ba4d85090b9bc32755c56601ffdc528afd17fd6282fe930",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "71169839497420596285841847514123589847893415750912355173877524195175834054354",
+      "symbol": "polymarket:0xd65891729ce093cc12236856837eba1a0872fc7998fd4294c21346f7db68079c:0",
+      "title": "Will Josh Shapiro win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0xd65891729ce093cc12236856837eba1a0872fc7998fd4294c21346f7db68079c",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "55290827599553280245963175724940496753557722439999671239772487781170052583987",
+      "symbol": "polymarket:0xd65891729ce093cc12236856837eba1a0872fc7998fd4294c21346f7db68079c:1",
+      "title": "Will Josh Shapiro win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0xd65891729ce093cc12236856837eba1a0872fc7998fd4294c21346f7db68079c",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "52310257194926233099477326083312959938983447523839326865869372741334281264830",
+      "symbol": "polymarket:0xdce84960dce38aa4a5800a5eba7c9ac34d2ce49ba9d44c42572c472d468af264:0",
+      "title": "Will Raphael Warnock win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0xdce84960dce38aa4a5800a5eba7c9ac34d2ce49ba9d44c42572c472d468af264",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "88403451835230950222119400360490338078378790763472355557584611572247419676051",
+      "symbol": "polymarket:0xdce84960dce38aa4a5800a5eba7c9ac34d2ce49ba9d44c42572c472d468af264:1",
+      "title": "Will Raphael Warnock win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0xdce84960dce38aa4a5800a5eba7c9ac34d2ce49ba9d44c42572c472d468af264",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "57761428076807364758801249497410455358987881775226117256631754592198558850468",
+      "symbol": "polymarket:0xe39adea057926dc197fe30a441f57a340b2a232d5a687010f78bba9b6e02620f:0",
+      "title": "Will Gretchen Whitmer win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0xe39adea057926dc197fe30a441f57a340b2a232d5a687010f78bba9b6e02620f",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "64300336035644500626313522990854070672468621241744347587785777226296613235598",
+      "symbol": "polymarket:0xe39adea057926dc197fe30a441f57a340b2a232d5a687010f78bba9b6e02620f:1",
+      "title": "Will Gretchen Whitmer win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0xe39adea057926dc197fe30a441f57a340b2a232d5a687010f78bba9b6e02620f",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "107064985435494333113391038470401719113272800530429703182710416066774068907304",
+      "symbol": "polymarket:0xe6bcc2f1dd025ce5e1833190f7c60a71171c94f805df55b9ab0ded695ec93565:0",
+      "title": "Will Alexandria Ocasio-Cortez win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0xe6bcc2f1dd025ce5e1833190f7c60a71171c94f805df55b9ab0ded695ec93565",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "65176072261324737856085688071627118509549293922582857186996392180609764586527",
+      "symbol": "polymarket:0xe6bcc2f1dd025ce5e1833190f7c60a71171c94f805df55b9ab0ded695ec93565:1",
+      "title": "Will Alexandria Ocasio-Cortez win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0xe6bcc2f1dd025ce5e1833190f7c60a71171c94f805df55b9ab0ded695ec93565",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "103988345069738240821107916249290759786442703283901164377120414690701074137717",
+      "symbol": "polymarket:0xe883f2fda25a605a184bb5fe583afce6cc21ea0b348b6a3728ec3067553c548d:0",
+      "title": "Will J.B. Pritzker win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0xe883f2fda25a605a184bb5fe583afce6cc21ea0b348b6a3728ec3067553c548d",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "108650988487983371520585351370999192979899647080710024226285750050382033453124",
+      "symbol": "polymarket:0xe883f2fda25a605a184bb5fe583afce6cc21ea0b348b6a3728ec3067553c548d:1",
+      "title": "Will J.B. Pritzker win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0xe883f2fda25a605a184bb5fe583afce6cc21ea0b348b6a3728ec3067553c548d",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "58343456405874365460518182619380252930558598368174305791768670198253267891911",
+      "symbol": "polymarket:0xfee07be730188c94cd3644ed6f107fa3ea2dfab9989ce8d39aeeae064766abe3:0",
+      "title": "Will Jon Stewart win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0xfee07be730188c94cd3644ed6f107fa3ea2dfab9989ce8d39aeeae064766abe3",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "84566561349071752664514432513198569980219178901068420341175150225620958953893",
+      "symbol": "polymarket:0xfee07be730188c94cd3644ed6f107fa3ea2dfab9989ce8d39aeeae064766abe3:1",
+      "title": "Will Jon Stewart win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0xfee07be730188c94cd3644ed6f107fa3ea2dfab9989ce8d39aeeae064766abe3",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    }
+  ]
+}

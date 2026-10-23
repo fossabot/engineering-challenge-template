@@ -14,6 +14,7 @@ macro_rules! schemas {
                 unused_assignments,
                 unused_comparisons,
                 unused_unsafe,
+                unsafe_code,
                 clippy::all
             )]
             include!(concat!(env!("OUT_DIR"), "/", stringify!($schema), ".rs"));

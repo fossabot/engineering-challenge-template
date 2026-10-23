@@ -1,0 +1,44 @@
+# Kalshi collector example. Credentials may also come from KALSHI_API_KEY_ID,
+# KALSHI_PRIVATE_KEY_PATH, or KALSHI_PRIVATE_KEY_PEM.
+exchange = "kalshi"
+
+[kalshi]
+# Demo is the built-in default. Set "production" explicitly for live data.
+environment = "demo"
+key_id = ""
+# private_key_path = "/absolute/path/to/kalshi-private-key.pem"
+batch_size = 100
+discovery_page_size = 1000
+request_timeout_secs = 20
+discovery_page_delay_ms = 50
+
+[collector]
+# 0 derives the shard count from the initial symbol count and the soft socket
+# capacity below. A non-zero value is fixed for the run.
+shards = 0
+replicas = 2
+max_symbols_per_socket = 5000
+max_shards = 64
+snapshot_interval_secs = 60
+discovery_interval_secs = 30
+reconnect_after_secs = 1800
+connection_idle_timeout_secs = 45
+stale_probe_after_secs = 120
+probe_interval_secs = 30
+max_probes = 3
+final_snapshots = true
+writer_queue = 16384
+flush_interval_secs = 1
+max_markets = 0
+duration_secs = 0
+writer_send_timeout_secs = 30
+
+[output]
+path = "captures/kalshi-demo.sbe"
+chunk_size = 65536
+metadata_path = "captures/kalshi-demo-markets.json"
+report_path = "captures/kalshi-demo-report.json"
+sync_on_close = true
+
+[metrics]
+listen = "127.0.0.1:9090"

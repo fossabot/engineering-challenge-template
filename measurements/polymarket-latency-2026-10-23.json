@@ -1,0 +1,27 @@
+{
+  "exchange": "polymarket",
+  "environment": "public",
+  "measured_at_us": 1792730309771980,
+  "discovery_rtt_ms": 1725.944375,
+  "discovered_markets": 3,
+  "subscribed_markets": 3,
+  "duration_secs": 15,
+  "frames": 17,
+  "events": 33,
+  "bytes": 26880,
+  "latency_samples": 33,
+  "negative_latency_samples": 0,
+  "latency_p50_us": 242669,
+  "latency_p95_us": 4511709,
+  "latency_p99_us": 4511709,
+  "latency_min_us": 183544,
+  "latency_max_us": 4511709,
+  "latency_mean_us": 615049,
+  "error": null,
+  "notes": [
+    "discovery_rtt_ms is a local wall-clock measurement around one discovery call",
+    "latency is local_receive_us - exchange_timestamp_us and includes exchange/local clock offset",
+    "negative values are counted separately and excluded from percentiles",
+    "no latency value is reported when no timestamped events arrived"
+  ]
+}

@@ -1,0 +1,16 @@
+{"type":"discovery","received_at_us":1700000000000000,"markets":[{"exchange":"kalshi","native_symbol":"TEST-A","symbol":"kalshi:TEST-A","title":"Test market A","outcome":null,"exchange_market_id":"TEST","close_time_us":1700086400000000,"tick_size_us":10000},{"exchange":"kalshi","native_symbol":"TEST-B","symbol":"kalshi:TEST-B","title":"Test market B","outcome":null,"exchange_market_id":"TEST","close_time_us":1700086400000000,"tick_size_us":10000}]}
+{"type":"status","received_at_us":1700000001000000,"source":{"shard":0,"replica":0},"connected":true,"last_frame_us":1700000001000000}
+{"type":"status","received_at_us":1700000001100000,"source":{"shard":0,"replica":1},"connected":true,"last_frame_us":1700000001100000}
+{"type":"snapshot","received_at_us":1700000002000000,"source":{"shard":0,"replica":0},"native_symbol":"TEST-A","bids":[{"price":400000,"quantity":100000000}],"asks":[{"price":600000,"quantity":80000000}],"exchange_ts_us":1700000001500000,"seq":1,"clock":1}
+{"type":"snapshot","received_at_us":1700000002100000,"source":{"shard":0,"replica":0},"native_symbol":"TEST-B","bids":[{"price":300000,"quantity":50000000}],"asks":[{"price":700000,"quantity":60000000}],"exchange_ts_us":1700000001600000,"seq":1,"clock":1}
+{"type":"snapshot","received_at_us":1700000002200000,"source":{"shard":0,"replica":1},"native_symbol":"TEST-A","bids":[{"price":410000,"quantity":90000000}],"asks":[{"price":590000,"quantity":70000000}],"exchange_ts_us":1700000001700000,"seq":1,"clock":2}
+{"type":"delta","received_at_us":1700000003000000,"source":{"shard":0,"replica":0},"native_symbol":"TEST-A","side":"Buy","price":410000,"quantity":150000000,"exchange_ts_us":1700000002500000,"seq":2,"clock":2}
+{"type":"status","received_at_us":1700000004000000,"source":{"shard":0,"replica":0},"connected":false,"last_frame_us":1700000003000000,"last_error":"simulated disconnect"}
+{"type":"snapshot","received_at_us":1700000005000000,"source":{"shard":0,"replica":1},"native_symbol":"TEST-B","bids":[{"price":310000,"quantity":40000000}],"asks":[{"price":690000,"quantity":55000000}],"exchange_ts_us":1700000004500000,"seq":1,"clock":3}
+{"type":"reset","received_at_us":1700000006000000,"source":{"shard":0,"replica":1},"native_symbols":["TEST-A"],"reason":"sequence_gap"}
+{"type":"snapshot","received_at_us":1700000007000000,"source":{"shard":0,"replica":1},"native_symbol":"TEST-A","bids":[{"price":420000,"quantity":85000000}],"asks":[{"price":580000,"quantity":65000000}],"exchange_ts_us":1700000006500000,"seq":3,"clock":4}
+{"type":"delta","received_at_us":1700000008000000,"source":{"shard":0,"replica":1},"native_symbol":"TEST-A","side":"Buy","price":420000,"quantity":175000000,"exchange_ts_us":1700000007500000,"seq":4,"clock":4}
+{"type":"lifecycle","received_at_us":1700000009000000,"source":{"shard":0,"replica":1},"native_symbol":"TEST-B","kind":"deactivated","exchange_ts_us":1700000008500000}
+{"type":"discovery","received_at_us":1700000010000000,"markets":[{"exchange":"kalshi","native_symbol":"TEST-A","symbol":"kalshi:TEST-A","title":"Test market A","outcome":null,"exchange_market_id":"TEST","close_time_us":1700086400000000,"tick_size_us":10000}]}
+{"type":"tick","received_at_us":1700000068000000}
+{"type":"tick","received_at_us":1700000130000000}

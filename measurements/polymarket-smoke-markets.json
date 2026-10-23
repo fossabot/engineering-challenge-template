@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "generated_at_us": 1792732708364455,
+  "exchange": "polymarket",
+  "count": 4,
+  "markets": [
+    {
+      "exchange": "polymarket",
+      "native_symbol": "54533043819946592547517511176940999955633860128497669742211153063842200957669",
+      "symbol": "polymarket:0x0f49db97f71c68b1e42a6d16e3de93d85dbf7d4148e3f018eb79e88554be9f75:will-gavin-newsom-win-the-2028-democratic-presidential-nomination-568:0",
+      "title": "Will Gavin Newsom win the 2028 Democratic presidential nomination?",
+      "outcome": "Yes",
+      "exchange_market_id": "0x0f49db97f71c68b1e42a6d16e3de93d85dbf7d4148e3f018eb79e88554be9f75",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "87854174148074652060467921081181402357467303721471806610111179101805869578687",
+      "symbol": "polymarket:0x0f49db97f71c68b1e42a6d16e3de93d85dbf7d4148e3f018eb79e88554be9f75:will-gavin-newsom-win-the-2028-democratic-presidential-nomination-568:1",
+      "title": "Will Gavin Newsom win the 2028 Democratic presidential nomination?",
+      "outcome": "No",
+      "exchange_market_id": "0x0f49db97f71c68b1e42a6d16e3de93d85dbf7d4148e3f018eb79e88554be9f75",
+      "close_time_us": 1857272340000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "32338220190071351435772801779725302244575775216413325951443816017994629993401",
+      "symbol": "polymarket:0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7:xi-jinping-out-before-2027:0",
+      "title": "Xi Jinping out before 2027?",
+      "outcome": "Yes",
+      "exchange_market_id": "0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7",
+      "close_time_us": 1798779540000000,
+      "tick_size_us": 1000
+    },
+    {
+      "exchange": "polymarket",
+      "native_symbol": "25659310674993675562345759665114759892400026242514633218387667107987341231962",
+      "symbol": "polymarket:0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7:xi-jinping-out-before-2027:1",
+      "title": "Xi Jinping out before 2027?",
+      "outcome": "No",
+      "exchange_market_id": "0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7",
+      "close_time_us": 1798779540000000,
+      "tick_size_us": 1000
+    }
+  ]
+}

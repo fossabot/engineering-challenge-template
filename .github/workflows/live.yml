@@ -1,0 +1,33 @@
+name: Live public-feed integration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  polymarket:
+    name: Polymarket public discovery and websocket
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      # No credentials are used. The test is ignored by default and is enabled
+      # only in this manual workflow.
+      - name: Run public-feed integration test
+        env:
+          RUN_LIVE_TESTS: "1"
+        run: cargo test --test live_polymarket --locked -- --ignored --nocapture

@@ -1,6 +1,6 @@
 //! Defines the [`AlignedSbeReader`], which allows us to quickly read SBE
 //! messages written by the
-//! [`AlignedSbeWriter`](crate::util::aligned_sbe_writer::AlignedSbeWriter)
+//! [`AlignedSbeWriter`](crate::util::aligned_sbe_writer::AlignedSbeWriter).
 
 use std::{fs::File, marker::PhantomData, os::unix::fs::FileExt, path::Path};
 
@@ -75,11 +75,30 @@ impl<T: AlignedSbeSchema> AlignedSbeReader<T> {
         Self::open_with_chunk_size(path, DEFAULT_CHUNK_SIZE)
     }
 
+    /// Detect the power-of-two chunk size used by an aligned writer and open
+    /// the file with that alignment.
+    ///
+    /// Detection reads the file once and validates every chunk boundary against
+    /// the SBE schema. Captures produced by this project are always flushed to
+    /// whole chunks, so the file length is an exact multiple of the chunk size.
+    pub fn open_auto(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+        let bytes = std::fs::read(path)?;
+        let chunk_size = detect_chunk_size::<T>(&bytes)?;
+        Self::open_with_chunk_size(path, chunk_size)
+    }
+
     /// Create a new [`AlignedSbeReader`] from the file at `path`, with
     /// `chunk_size` for chunk size.
-    fn open_with_chunk_size(path: impl AsRef<Path>, chunk_size: usize) -> anyhow::Result<Self> {
+    pub fn open_with_chunk_size(path: impl AsRef<Path>, chunk_size: usize) -> anyhow::Result<Self> {
         let file = File::open(path)?;
         let file_len = file.metadata()?.len();
+        anyhow::ensure!(chunk_size >= 1024, "chunk size must be at least 1024");
+        anyhow::ensure!(
+            file_len == 0 || file_len % chunk_size as u64 == 0,
+            "file length {file_len} is not a multiple of chunk size {chunk_size}; \
+             pass the writer's exact chunk size or use --chunk-size auto"
+        );
 
         Ok(Self {
             file: Some(file),
@@ -93,6 +112,12 @@ impl<T: AlignedSbeSchema> AlignedSbeReader<T> {
             recycled_chunks: None,
             _schema: PhantomData,
         })
+    }
+
+    /// Chunk size in bytes used for aligned reads.
+    #[must_use]
+    pub fn chunk_size(&self) -> usize {
+        self.chunk_size
     }
 
     /// Create a task to be passed up to the owner of this reader, so it can run
@@ -218,6 +243,15 @@ impl<T: AlignedSbeSchema> AlignedSbeReader<T> {
                 break;
             }
 
+            // A chunk sentinel is a run of zero bytes through the end of the
+            // chunk. Anything non-zero after the first zero header is malformed
+            // and must not be silently skipped while advancing to the next
+            // chunk.
+            anyhow::ensure!(
+                self.buffer[self.buffer_pos..].iter().all(|byte| *byte == 0),
+                "non-zero bytes after the aligned SBE chunk sentinel"
+            );
+
             if !self.load_chunk()? {
                 return Ok(None);
             }
@@ -243,9 +277,125 @@ impl<T: AlignedSbeSchema> AlignedSbeReader<T> {
             .buffer_pos
             .checked_add(message_len)
             .context("overflow")?;
+        anyhow::ensure!(
+            end <= self.buffer.len(),
+            "SBE message crosses the aligned chunk boundary"
+        );
 
         self.buffer_pos = end;
 
         Ok(Some(decoded))
+    }
+}
+
+/// Scan power-of-two chunk sizes and return the smallest one whose every chunk
+/// boundary is a valid SBE stream.
+pub fn detect_chunk_size<T: AlignedSbeSchema>(bytes: &[u8]) -> anyhow::Result<usize> {
+    if bytes.is_empty() {
+        return Ok(DEFAULT_CHUNK_SIZE);
+    }
+
+    let mut best: Option<(usize, usize)> = None; // (chunk size, message count)
+    let mut chunk = 1024usize;
+    while chunk <= bytes.len() {
+        if bytes.len().is_multiple_of(chunk) {
+            match validate_aligned::<T>(bytes, chunk) {
+                Ok(count) if count > 0 && best.is_none_or(|(_, best_count)| count > best_count) => {
+                    best = Some((chunk, count));
+                }
+                _ => {}
+            }
+        }
+        chunk = chunk.saturating_mul(2);
+    }
+
+    if let Some((chunk, _)) = best {
+        return Ok(chunk);
+    }
+
+    anyhow::bail!(
+        "could not auto-detect chunk size for {} bytes of SBE data; \
+         specify --chunk-size explicitly",
+        bytes.len()
+    )
+}
+
+fn validate_aligned<T: AlignedSbeSchema>(bytes: &[u8], chunk: usize) -> anyhow::Result<usize> {
+    let mut total = 0usize;
+    for start in (0..bytes.len()).step_by(chunk) {
+        let end = start + chunk;
+        let mut pos = 0usize;
+        while pos < chunk {
+            let offset = start + pos;
+            let remaining = end - offset;
+            if remaining < HEADER_LENGTH {
+                anyhow::bail!("truncated header");
+            }
+            let header = &bytes[offset..offset + HEADER_LENGTH];
+            if header == [0; HEADER_LENGTH] {
+                anyhow::ensure!(
+                    bytes[offset..end].iter().all(|byte| *byte == 0),
+                    "non-zero bytes after the chunk sentinel"
+                );
+                break;
+            }
+            let block_length = usize::from(u16::from_le_bytes([header[0], header[1]]));
+            let schema_id = u16::from_le_bytes([header[4], header[5]]);
+            let schema_version = u16::from_le_bytes([header[6], header[7]]);
+            anyhow::ensure!(schema_id == T::SCHEMA_ID, "schema id mismatch");
+            anyhow::ensure!(
+                schema_version == T::SCHEMA_VERSION,
+                "schema version mismatch"
+            );
+
+            let (message_len, expected_block_length) = {
+                let decoded = T::try_decode(bytes, offset)?;
+                (
+                    T::encoded_length(&decoded)?,
+                    T::expected_block_length(&decoded)?,
+                )
+            };
+            anyhow::ensure!(
+                block_length == expected_block_length,
+                "block length mismatch"
+            );
+            anyhow::ensure!(message_len >= HEADER_LENGTH, "invalid message length");
+            anyhow::ensure!(message_len <= remaining, "message crosses chunk boundary");
+            pos += message_len;
+            total += 1;
+        }
+    }
+    Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+    use crate::util::OrderbookSchema;
+
+    #[test]
+    fn rejects_non_zero_bytes_after_a_chunk_sentinel() {
+        let path = std::env::temp_dir().join(format!(
+            "engineering-challenge-sentinel-{}-{}.sbe",
+            std::process::id(),
+            crate::time::now_us().unwrap_or(0)
+        ));
+        let mut bytes = vec![0u8; 1024];
+        bytes[100] = 1;
+        {
+            let mut file = File::create(&path).unwrap();
+            file.write_all(&bytes).unwrap();
+            file.sync_all().unwrap();
+        }
+        let mut reader =
+            AlignedSbeReader::<OrderbookSchema>::open_with_chunk_size(&path, 1024).unwrap();
+        let error = match reader.read_msg() {
+            Ok(_) => panic!("expected a sentinel validation error"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("non-zero bytes"), "{error}");
+        let _ = std::fs::remove_file(path);
     }
 }

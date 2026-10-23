@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "tool": "engineering-challenge",
+  "version": "0.3.0",
+  "mode": "live",
+  "exchange": "polymarket",
+  "environment": "public",
+  "started_at_us": 1792732686519415,
+  "ended_at_us": 1792732708358408,
+  "shutdown_reason": "duration elapsed (20s)",
+  "output_path": "/tmp/ec-smoke/polymarket.sbe",
+  "shard_count": 1,
+  "replica_count": 2,
+  "discovered_symbols": 4,
+  "final_symbols": 4,
+  "core": {
+    "discovery_rounds": 1,
+    "discovered_symbols": 4,
+    "added_symbols": 4,
+    "removed_symbols": 0,
+    "exchange_snapshots": 4,
+    "periodic_snapshots": 0,
+    "failover_snapshots": 0,
+    "final_snapshots": 4,
+    "empty_snapshots": 0,
+    "deltas_emitted": 50,
+    "deltas_rejected": 0,
+    "sequence_resets": 0,
+    "source_switches": 0,
+    "stale_probes": 0,
+    "stale_failovers": 0,
+    "crossed_snapshots_skipped": 0,
+    "duplicate_events": 0,
+    "lifecycle_events": 0,
+    "current_symbols": 4,
+    "shard_count": 1
+  },
+  "writer": {
+    "messages": 58,
+    "bytes": 65536,
+    "flushes": 2,
+    "errors": 0,
+    "queue_depth": 0
+  },
+  "sources": [
+    {
+      "source": {
+        "shard": 0,
+        "replica": 0
+      },
+      "connected": false,
+      "reconnects": 0,
+      "messages": 27,
+      "decode_errors": 0,
+      "protocol_errors": 0,
+      "bytes_received": 39818,
+      "last_frame_us": 1792732706904937,
+      "last_keepalive_us": 1792732699276970,
+      "latency_ewma_us": 170303,
+      "subscriptions": 0,
+      "last_error": null
+    },
+    {
+      "source": {
+        "shard": 0,
+        "replica": 1
+      },
+      "connected": false,
+      "reconnects": 0,
+      "messages": 27,
+      "decode_errors": 0,
+      "protocol_errors": 0,
+      "bytes_received": 39818,
+      "last_frame_us": 1792732706895483,
+      "last_keepalive_us": 1792732699238841,
+      "latency_ewma_us": 160966,
+      "subscriptions": 0,
+      "last_error": null
+    }
+  ],
+  "config": {
+    "exchange": "polymarket",
+    "shard_count": 1,
+    "replica_count": 2,
+    "snapshot_interval_secs": 60,
+    "discovery_interval_secs": 30,
+    "reconnect_after_secs": 1800,
+    "connection_idle_timeout_secs": 45,
+    "stale_probe_after_secs": 120,
+    "probe_interval_secs": 30,
+    "max_probes": 3,
+    "max_markets": 4,
+    "writer_queue": 16384,
+    "flush_interval_secs": 60,
+    "output_chunk_size": 65536
+  }
+}

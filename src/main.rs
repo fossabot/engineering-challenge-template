@@ -1,66 +1,106 @@
-use chrono::DateTime;
-use engineering_challenge::Side;
-use engineering_challenge::util::dtos::challenge_orderbook::{
-    AnyMessage, PriceLevelUpdateDomain, SnapshotAsksEntryDomain, SnapshotBidsEntryDomain,
-    SnapshotDomain,
+//! Collector binary entry point.
+
+mod cli;
+
+use anyhow::Context;
+use clap::Parser;
+use tracing_subscriber::EnvFilter;
+
+use engineering_challenge::{
+    config::Settings, coordinator, inspect, latency, replay, report::write_json_atomic,
 };
-use engineering_challenge::util::{AlignedSbeReader, AlignedSbeWriter, OrderbookSchema};
 
-const CHUNK_SIZE_64_MEBIBYTES: usize = 64 << 20;
+use crate::cli::{Cli, Command};
 
-/// This is a dummy example where we define a snapshot and price level update,
-/// write them to a file using [`AlignedSbeWriter`], and then read them back
-/// from the same file using [`AlignedSbeReader`], asserting that what we read
-/// back is the exact same as what we wrote.
-///
-/// You should replace this main function with your actual solution, and split
-/// up your code into modules in `src/` in a way that makes sense to you.
-fn main() -> anyhow::Result<()> {
-    let timestamp = DateTime::from_timestamp_micros(1_700_000_000_000_000).unwrap();
-    let symbol = "EXAMPLE".to_owned();
-    let snapshot = SnapshotDomain {
-        received_at: timestamp,
-        exchange_timestamp: timestamp,
-        bids: vec![SnapshotBidsEntryDomain {
-            price_level: 400_000,
-            quantity: 2_000_000,
-        }],
-        asks: vec![SnapshotAsksEntryDomain {
-            price_level: 600_000,
-            quantity: 3_500_000,
-        }],
-        symbol: symbol.clone(),
-    };
-    let update = PriceLevelUpdateDomain {
-        backtest_timestamp: timestamp,
-        exchange_timestamp: timestamp,
-        price_level: 400_000,
-        quantity: 1_250_000,
-        side: Side::Buy,
-        symbol: symbol.clone(),
-    };
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    init_tracing(cli.log_json)?;
+    let mut settings = Settings::load(cli.config.as_deref())?;
+    cli.apply_settings(&mut settings)?;
+    match cli.command.unwrap_or(Command::Collect) {
+        Command::Collect => {
+            let report = coordinator::run(settings).await?;
+            eprintln!(
+                "collector stopped: {} SBE messages, {} bytes, {} symbols, reason={}",
+                report.writer.messages,
+                report.writer.bytes,
+                report.final_symbols,
+                report.shutdown_reason
+            );
+            Ok(())
+        }
+        Command::Replay { input } => {
+            let report = replay::run(settings, &input)?;
+            eprintln!(
+                "replay complete: {} SBE messages, {} bytes, {} symbols",
+                report.writer.messages, report.writer.bytes, report.final_symbols
+            );
+            Ok(())
+        }
+        Command::Inspect {
+            input,
+            read_chunk_size,
+            limit,
+        } => {
+            let summary = inspect::run(&input, &read_chunk_size, limit)?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+            Ok(())
+        }
+        Command::Latency { out } => {
+            let max_markets = if settings.collector.max_markets == 0 {
+                10
+            } else {
+                settings.collector.max_markets
+            };
+            let duration_secs = if settings.collector.duration_secs == 0 {
+                30
+            } else {
+                settings.collector.duration_secs
+            };
+            let report = latency::run(settings, max_markets, duration_secs, out.as_deref()).await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        Command::Discover { out } => {
+            let exchange = coordinator::build_exchange(&settings, false)?;
+            let markets = exchange
+                .discover_markets(settings.collector.max_markets)
+                .await
+                .with_context(|| format!("discovering {} markets", exchange.name()))?;
+            let result = serde_json::json!({
+                "schema_version": 1,
+                "exchange": exchange.name(),
+                "environment": exchange.environment(),
+                "count": markets.len(),
+                "markets": markets,
+            });
+            if let Some(path) = out.as_deref() {
+                write_json_atomic(path, &result).context("writing discovery output")?;
+            }
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
+    }
+}
 
-    let file = tempfile::NamedTempFile::new()?;
-    let mut writer = AlignedSbeWriter::create(file.path(), CHUNK_SIZE_64_MEBIBYTES)?;
-    writer.write_msg(&snapshot)?;
-    writer.write_msg(&update)?;
-    writer.flush()?;
-    drop(writer);
-
-    let mut reader = AlignedSbeReader::<OrderbookSchema>::open(file.path())?;
-
-    let Some(AnyMessage::Snapshot(decoded)) = reader.read_msg()? else {
-        anyhow::bail!("expected snapshot");
-    };
-    assert_eq!(SnapshotDomain::try_from_decoder(decoded)?, snapshot);
-
-    let Some(AnyMessage::PriceLevelUpdate(decoded)) = reader.read_msg()? else {
-        anyhow::bail!("expected price level update");
-    };
-    assert_eq!(PriceLevelUpdateDomain::try_from_decoder(decoded)?, update);
-    assert!(reader.read_msg()?.is_none());
-
-    println!("Verification success!");
-
+fn init_tracing(json: bool) -> anyhow::Result<()> {
+    let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    if json {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter())
+            .with_target(false)
+            .with_writer(std::io::stderr)
+            .json()
+            .try_init()
+            .map_err(|error| anyhow::anyhow!("initializing JSON tracing subscriber: {error}"))?;
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter())
+            .with_target(false)
+            .with_writer(std::io::stderr)
+            .try_init()
+            .map_err(|error| anyhow::anyhow!("initializing tracing subscriber: {error}"))?;
+    }
     Ok(())
 }

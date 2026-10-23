@@ -1,0 +1,40 @@
+# Credential-free public fallback example.
+exchange = "polymarket"
+
+[polymarket]
+gamma_url = "https://gamma-api.polymarket.com"
+ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+batch_size = 500
+discovery_page_size = 500
+request_timeout_secs = 20
+discovery_page_delay_ms = 50
+require_accepting_orders = true
+
+[collector]
+shards = 0
+replicas = 2
+max_symbols_per_socket = 5000
+max_shards = 64
+snapshot_interval_secs = 60
+discovery_interval_secs = 30
+reconnect_after_secs = 1800
+connection_idle_timeout_secs = 45
+stale_probe_after_secs = 120
+probe_interval_secs = 30
+max_probes = 3
+final_snapshots = true
+writer_queue = 16384
+flush_interval_secs = 1
+max_markets = 20
+duration_secs = 0
+writer_send_timeout_secs = 30
+
+[output]
+path = "captures/polymarket.sbe"
+chunk_size = 65536
+metadata_path = "captures/polymarket-markets.json"
+report_path = "captures/polymarket-report.json"
+sync_on_close = true
+
+[metrics]
+listen = "127.0.0.1:9090"

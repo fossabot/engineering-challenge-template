@@ -1,0 +1,36 @@
+{
+  "$schema": "https://repomix.com/schemas/latest/schema.json",
+  "output": {
+    "filePath": "engineering-challenge-repo.md",
+    "style": "markdown",
+    "fileSummary": true,
+    "directoryStructure": true,
+    "includeFullDirectoryStructure": true,
+    "files": true,
+    "removeComments": false,
+    "removeEmptyLines": false,
+    "compress": false,
+    "git": {
+      "includeLogs": false,
+      "includeDiffs": false
+    }
+  },
+  "include": [],
+  "ignore": {
+    "useGitignore": true,
+    "useDotIgnore": true,
+    "useDefaultPatterns": true,
+    "customPatterns": [
+      "**/target/**",
+      "**/build/**",
+      "**/dist/**",
+      "**/node_modules/**",
+      "**/.idea/**",
+      "**/.vscode/**",
+      "**/.DS_Store"
+    ]
+  },
+  "security": {
+    "enableSecurityCheck": true
+  }
+}

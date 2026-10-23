@@ -1,0 +1,634 @@
+//! Generic websocket supervisor. Exchange adapters implement
+//! [`MarketDataSession`]; this module owns reconnects, heartbeats, status
+//! reporting, and command handling.
+
+use std::{
+    collections::BTreeSet,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use async_trait::async_trait;
+use tokio::sync::{broadcast, mpsc};
+use tracing::{info, warn};
+
+use crate::{
+    config::CollectorSettings,
+    model::{Control, ExchangeEvent, ResetReason, SourceId, SourceStatus},
+    time::now_us,
+};
+
+/// A batch of normalized events decoded from one websocket payload.
+#[derive(Debug, Default)]
+pub struct SessionFrame {
+    pub events: Vec<ExchangeEvent>,
+    pub bytes: usize,
+}
+
+impl SessionFrame {
+    #[must_use]
+    pub fn idle(bytes: usize) -> Self {
+        Self {
+            events: Vec::new(),
+            bytes,
+        }
+    }
+}
+
+/// Failure classification for an exchange session.
+#[derive(Debug)]
+pub enum SessionFailure {
+    /// Transient transport failure: drop this socket, reconnect with backoff.
+    Reconnect(anyhow::Error),
+    /// The exchange sent data that could not be decoded.
+    Decode(anyhow::Error),
+    /// A decoded frame violated the exchange protocol (sequence gap, server error).
+    Protocol(anyhow::Error),
+    /// Configuration or authentication failure: retrying cannot help.
+    Fatal(anyhow::Error),
+}
+
+impl From<anyhow::Error> for SessionFailure {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Reconnect(error)
+    }
+}
+
+/// One websocket connection implementing an exchange protocol.
+#[async_trait]
+pub trait MarketDataSession: Send {
+    async fn connect(&mut self) -> Result<(), SessionFailure>;
+    /// Reconcile the server-side subscription with `desired`. Called after each
+    /// successful connect and whenever the desired set changes.
+    async fn apply_subscriptions(
+        &mut self,
+        desired: &BTreeSet<String>,
+    ) -> Result<(), SessionFailure>;
+    /// Read exactly one websocket payload (or a control frame) and decode it.
+    async fn next_frame(&mut self) -> Result<SessionFrame, SessionFailure>;
+    async fn send_keepalive(&mut self) -> Result<(), SessionFailure>;
+    /// Ask the exchange for fresh snapshots without changing membership when
+    /// supported; otherwise resubscribe the symbols.
+    async fn request_snapshot(&mut self, symbols: &[String]) -> Result<(), SessionFailure>;
+    async fn close(&mut self);
+}
+
+/// Creates sessions for a source. Implemented by each exchange adapter.
+#[async_trait]
+pub trait SessionFactory: Send + Sync + 'static {
+    async fn create_session(&self, source: SourceId) -> anyhow::Result<Box<dyn MarketDataSession>>;
+}
+
+/// Events sent from a source worker to the coordinator.
+#[derive(Debug)]
+pub enum WorkerEvent {
+    Events {
+        source: SourceId,
+        events: Vec<ExchangeEvent>,
+    },
+    Status(SourceStatus),
+    Fatal {
+        source: SourceId,
+        error: String,
+    },
+    Stopped {
+        source: SourceId,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkerConfig {
+    pub keepalive_interval: Duration,
+    pub status_interval: Duration,
+    pub idle_timeout: Duration,
+    pub reconnect_after: Duration,
+    pub reconnect_base_backoff: Duration,
+    pub reconnect_max_backoff: Duration,
+}
+
+impl WorkerConfig {
+    #[must_use]
+    pub fn from_settings(settings: &CollectorSettings) -> Self {
+        Self {
+            keepalive_interval: Duration::from_secs(10),
+            status_interval: Duration::from_secs(1),
+            idle_timeout: Duration::from_secs(settings.connection_idle_timeout_secs),
+            reconnect_after: Duration::from_secs(settings.reconnect_after_secs),
+            reconnect_base_backoff: Duration::from_millis(500),
+            reconnect_max_backoff: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Supervisor task for one source.
+pub async fn run_worker(
+    factory: Arc<dyn SessionFactory>,
+    source: SourceId,
+    mut commands: mpsc::Receiver<Control>,
+    events: mpsc::Sender<WorkerEvent>,
+    config: WorkerConfig,
+    mut shutdown: broadcast::Receiver<()>,
+) {
+    let mut desired = BTreeSet::new();
+    let mut status = SourceStatus::new(source);
+    let mut session: Option<Box<dyn MarketDataSession>> = None;
+    let mut backoff = config.reconnect_base_backoff;
+    let mut attempts = 0u64;
+
+    loop {
+        if session.is_none() {
+            match factory.create_session(source).await {
+                Ok(new_session) => session = Some(new_session),
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    warn!(%source, error = %message, "failed to construct session");
+                    let _ = events
+                        .send(WorkerEvent::Fatal {
+                            source,
+                            error: message,
+                        })
+                        .await;
+                    break;
+                }
+            }
+        }
+
+        let Some(active) = session.as_mut() else {
+            break;
+        };
+        if let Err(failure) = active.connect().await {
+            match failure {
+                SessionFailure::Fatal(error) => {
+                    let message = format!("{error:#}");
+                    warn!(%source, error = %message, "fatal session error");
+                    let _ = events
+                        .send(WorkerEvent::Fatal {
+                            source,
+                            error: message,
+                        })
+                        .await;
+                    break;
+                }
+                SessionFailure::Reconnect(error)
+                | SessionFailure::Decode(error)
+                | SessionFailure::Protocol(error) => {
+                    warn!(%source, error = %format!("{error:#}"), "connect failed");
+                    status.last_error = Some(truncate_error(&error));
+                    status.connected = false;
+                    let _ = events.send(WorkerEvent::Status(status.clone())).await;
+                }
+            }
+            if let Some(mut failed) = session.take() {
+                failed.close().await;
+            }
+            attempts = attempts.saturating_add(1);
+            backoff = next_backoff(backoff, config.reconnect_max_backoff);
+            if !backoff_or_stop(
+                &mut commands,
+                &mut desired,
+                &events,
+                &mut status,
+                &mut shutdown,
+                backoff,
+            )
+            .await
+            {
+                close_and_stop(session.take(), &mut status, &events).await;
+                return;
+            }
+            continue;
+        }
+
+        attempts = attempts.saturating_add(1);
+        if attempts > 1 {
+            status.reconnects = status.reconnects.saturating_add(1);
+        }
+        status.connected = true;
+        status.subscriptions = desired.len();
+        status.last_error = None;
+        let now = Instant::now();
+        let next_periodic_reconnect =
+            now + config.reconnect_after + Duration::from_millis(rand::random::<u64>() % 60_000);
+        let mut idle_deadline = now + config.idle_timeout;
+        let mut next_keepalive = now + config.keepalive_interval;
+        let mut next_status = now + config.status_interval;
+        // A completed read may be dropped when another select branch wins. Keep
+        // the frame here so cancellation never loses market data.
+        let mut pending_frame: Option<SessionFrame> = None;
+
+        if !desired.is_empty() {
+            let reset = ExchangeEvent::StreamReset {
+                native_symbols: desired.iter().cloned().collect(),
+                reason: ResetReason::Connected,
+                received_at_us: now_us().unwrap_or(0),
+            };
+            if events
+                .send(WorkerEvent::Events {
+                    source,
+                    events: vec![reset],
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        if let Err(failure) = active.apply_subscriptions(&desired).await {
+            warn!(%source, error = %format!("{failure:?}"), "subscription reconciliation failed");
+            status.connected = false;
+            status.subscriptions = 0;
+            status.last_error = Some(failure_message(&failure));
+            let _ = events.send(WorkerEvent::Status(status.clone())).await;
+            if let Some(mut failed) = session.take() {
+                failed.close().await;
+            }
+            attempts = attempts.saturating_add(1);
+            backoff = next_backoff(backoff, config.reconnect_max_backoff);
+            if !backoff_or_stop(
+                &mut commands,
+                &mut desired,
+                &events,
+                &mut status,
+                &mut shutdown,
+                backoff,
+            )
+            .await
+            {
+                close_and_stop(session.take(), &mut status, &events).await;
+                return;
+            }
+            continue;
+        }
+        status.subscriptions = desired.len();
+        status.reconnects = status.reconnects.max(attempts.saturating_sub(1));
+        backoff = config.reconnect_base_backoff;
+        let _ = events.send(WorkerEvent::Status(status.clone())).await;
+        info!(%source, subscriptions = desired.len(), "source connected");
+
+        let mut must_reconnect = false;
+        let mut should_stop = false;
+        while !must_reconnect && !should_stop {
+            // Drain already-queued controls before polling the socket. This
+            // keeps subscription changes responsive even when frames arrive
+            // continuously, without letting a ready frame be discarded.
+            loop {
+                match commands.try_recv() {
+                    Ok(Control::Shutdown) | Err(mpsc::error::TryRecvError::Disconnected) => {
+                        should_stop = true;
+                        break;
+                    }
+                    Ok(Control::Reconnect(reason)) => {
+                        warn!(%source, reason, "reconnect requested");
+                        must_reconnect = true;
+                        break;
+                    }
+                    Ok(action) => {
+                        must_reconnect = handle_control(
+                            action,
+                            &mut desired,
+                            &mut status,
+                            &mut session,
+                            &events,
+                        )
+                        .await;
+                        if must_reconnect {
+                            break;
+                        }
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                }
+            }
+            if must_reconnect || should_stop {
+                break;
+            }
+
+            let now = Instant::now();
+            if now >= next_keepalive {
+                if let Some(active) = session.as_mut()
+                    && let Err(failure) = active.send_keepalive().await
+                {
+                    warn!(%source, error = %format!("{failure:?}"), "keepalive failed");
+                    status.last_error = Some(failure_message(&failure));
+                    must_reconnect = true;
+                }
+                status.last_keepalive_us = now_us().ok();
+                next_keepalive = now + config.keepalive_interval;
+            }
+            if now >= next_status {
+                let _ = events.send(WorkerEvent::Status(status.clone())).await;
+                next_status = now + config.status_interval;
+            }
+            if now >= next_periodic_reconnect {
+                info!(%source, "periodic websocket refresh");
+                must_reconnect = true;
+            }
+            if now >= idle_deadline {
+                warn!(%source, "websocket idle timeout");
+                status.last_error = Some("idle timeout".to_owned());
+                must_reconnect = true;
+            }
+            if must_reconnect || should_stop {
+                break;
+            }
+
+            let wake = next_keepalive
+                .min(next_status)
+                .min(next_periodic_reconnect)
+                .min(idle_deadline);
+            let mut pending_control: Option<Control> = None;
+            tokio::select! {
+                // Prefer a ready frame. Completed frames are also buffered by
+                // `next_frame_buffered`, so losing this race is safe.
+                biased;
+                frame = next_frame_buffered(&mut session, &mut pending_frame) => {
+                    match frame {
+                        Ok(frame) => {
+                            status.messages = status.messages.saturating_add(1);
+                            status.bytes_received =
+                                status.bytes_received.saturating_add(frame.bytes as u64);
+                            status.last_frame_us = now_us().ok();
+                            idle_deadline = Instant::now() + config.idle_timeout;
+                            update_latency(&mut status, &frame.events);
+                            if !frame.events.is_empty()
+                                && events
+                                    .send(WorkerEvent::Events {
+                                        source,
+                                        events: frame.events,
+                                    })
+                                    .await
+                                    .is_err()
+                            {
+                                should_stop = true;
+                            }
+                        }
+                        Err(failure) => {
+                            match failure {
+                                SessionFailure::Fatal(error) => {
+                                    let message = format!("{error:#}");
+                                    warn!(%source, error = %message, "fatal session error");
+                                    let _ = events.send(WorkerEvent::Fatal {
+                                        source,
+                                        error: message,
+                                    }).await;
+                                    should_stop = true;
+                                }
+                                SessionFailure::Decode(error) => {
+                                    warn!(%source, error = %format!("{error:#}"), "websocket decode failed");
+                                    status.decode_errors = status.decode_errors.saturating_add(1);
+                                    status.last_error = Some(truncate_error(&error));
+                                    must_reconnect = true;
+                                }
+                                SessionFailure::Protocol(error) => {
+                                    warn!(%source, error = %format!("{error:#}"), "websocket protocol error");
+                                    status.protocol_errors = status.protocol_errors.saturating_add(1);
+                                    status.last_error = Some(truncate_error(&error));
+                                    must_reconnect = true;
+                                }
+                                SessionFailure::Reconnect(error) => {
+                                    warn!(%source, error = %format!("{error:#}"), "websocket read failed");
+                                    status.last_error = Some(truncate_error(&error));
+                                    must_reconnect = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ = shutdown.recv() => {
+                    should_stop = true;
+                }
+                command = commands.recv() => {
+                    match command {
+                        None | Some(Control::Shutdown) => should_stop = true,
+                        Some(Control::Reconnect(reason)) => {
+                            warn!(%source, reason, "reconnect requested");
+                            must_reconnect = true;
+                        }
+                        Some(action) => pending_control = Some(action),
+                    }
+                }
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake)) => {}
+            }
+
+            if let Some(action) = pending_control {
+                must_reconnect =
+                    handle_control(action, &mut desired, &mut status, &mut session, &events).await;
+            }
+        }
+
+        if should_stop {
+            close_and_stop(session.take(), &mut status, &events).await;
+            return;
+        }
+
+        status.connected = false;
+        status.subscriptions = 0;
+        let _ = events.send(WorkerEvent::Status(status.clone())).await;
+        if let Some(mut old) = session.take() {
+            old.close().await;
+        }
+        backoff = next_backoff(backoff, config.reconnect_max_backoff);
+        if !backoff_or_stop(
+            &mut commands,
+            &mut desired,
+            &events,
+            &mut status,
+            &mut shutdown,
+            backoff,
+        )
+        .await
+        {
+            close_and_stop(session.take(), &mut status, &events).await;
+            return;
+        }
+    }
+
+    status.connected = false;
+    status.subscriptions = 0;
+    let _ = events.send(WorkerEvent::Status(status)).await;
+    let _ = events.send(WorkerEvent::Stopped { source }).await;
+}
+
+async fn handle_control(
+    action: Control,
+    desired: &mut BTreeSet<String>,
+    status: &mut SourceStatus,
+    session: &mut Option<Box<dyn MarketDataSession>>,
+    events: &mpsc::Sender<WorkerEvent>,
+) -> bool {
+    match action {
+        Control::SetSubscriptions(next) => {
+            *desired = next;
+            status.subscriptions = desired.len();
+            let mut reconnect = false;
+            if let Some(active) = session.as_mut()
+                && let Err(failure) = active.apply_subscriptions(desired).await
+            {
+                warn!(
+                    source = %status.source,
+                    error = %format!("{failure:?}"),
+                    "failed to update subscriptions"
+                );
+                status.last_error = Some(failure_message(&failure));
+                reconnect = true;
+            }
+            let _ = events.send(WorkerEvent::Status(status.clone())).await;
+            reconnect
+        }
+        Control::RequestSnapshot(symbols) => {
+            if let Some(active) = session.as_mut()
+                && let Err(failure) = active.request_snapshot(&symbols).await
+            {
+                warn!(
+                    source = %status.source,
+                    error = %format!("{failure:?}"),
+                    "snapshot request failed"
+                );
+                status.last_error = Some(failure_message(&failure));
+                return true;
+            }
+            false
+        }
+        Control::Reconnect(reason) => {
+            warn!(source = %status.source, reason, "reconnect requested");
+            true
+        }
+        Control::Shutdown => false,
+    }
+}
+
+/// Read one frame without losing a completed future when another `select!`
+/// branch wins. The inner read is cancellation-safe at the transport level; if
+/// it completes during a losing poll, the frame is stored in `pending` before
+/// this future returns.
+async fn next_frame_buffered(
+    session: &mut Option<Box<dyn MarketDataSession>>,
+    pending: &mut Option<SessionFrame>,
+) -> Result<SessionFrame, SessionFailure> {
+    if let Some(frame) = pending.take() {
+        return Ok(frame);
+    }
+    let frame = match session.as_mut() {
+        Some(active) => active.next_frame().await?,
+        None => {
+            return Err(SessionFailure::Reconnect(anyhow::anyhow!(
+                "missing session"
+            )));
+        }
+    };
+    *pending = Some(frame);
+    Ok(pending.take().expect("frame was just stored"))
+}
+
+async fn close_and_stop(
+    session: Option<Box<dyn MarketDataSession>>,
+    status: &mut SourceStatus,
+    events: &mpsc::Sender<WorkerEvent>,
+) {
+    if let Some(mut session) = session {
+        session.close().await;
+    }
+    status.connected = false;
+    status.subscriptions = 0;
+    let _ = events.send(WorkerEvent::Status(status.clone())).await;
+    let _ = events
+        .send(WorkerEvent::Stopped {
+            source: status.source,
+        })
+        .await;
+}
+
+/// During backoff, keep accepting control messages so subscription changes and
+/// shutdown do not have to wait for the retry timer.
+async fn backoff_or_stop(
+    commands: &mut mpsc::Receiver<Control>,
+    desired: &mut BTreeSet<String>,
+    events: &mpsc::Sender<WorkerEvent>,
+    status: &mut SourceStatus,
+    shutdown: &mut broadcast::Receiver<()>,
+    duration: Duration,
+) -> bool {
+    let sleep = tokio::time::sleep(duration);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return true,
+            _ = shutdown.recv() => return false,
+            command = commands.recv() => match command {
+                None | Some(Control::Shutdown) => return false,
+                Some(Control::SetSubscriptions(next)) => {
+                    *desired = next;
+                    status.subscriptions = desired.len();
+                    let _ = events.send(WorkerEvent::Status(status.clone())).await;
+                }
+                Some(Control::Reconnect(_)) | Some(Control::RequestSnapshot(_)) => {}
+            },
+        }
+    }
+}
+
+fn next_backoff(current: Duration, maximum: Duration) -> Duration {
+    let doubled = current.saturating_mul(2).min(maximum);
+    let jitter = 0.8 + rand::random::<f64>() * 0.4;
+    doubled.mul_f64(jitter).min(maximum)
+}
+
+fn update_latency(status: &mut SourceStatus, events: &[ExchangeEvent]) {
+    for event in events {
+        let meta = match event {
+            ExchangeEvent::Snapshot { meta, .. }
+            | ExchangeEvent::LevelChange { meta, .. }
+            | ExchangeEvent::Lifecycle { meta, .. } => Some(meta),
+            ExchangeEvent::StreamReset { .. } => None,
+        };
+        let Some(meta) = meta else {
+            continue;
+        };
+        let Some(exchange_ts) = meta.exchange_ts_us else {
+            continue;
+        };
+        let latency = meta.received_at_us.saturating_sub(exchange_ts);
+        if !(0..=60_000_000).contains(&latency) {
+            continue;
+        }
+        status.latency_ewma_us = Some(match status.latency_ewma_us {
+            Some(previous) => (previous * 4 + latency) / 5,
+            None => latency,
+        });
+    }
+}
+
+fn failure_message(failure: &SessionFailure) -> String {
+    match failure {
+        SessionFailure::Reconnect(error)
+        | SessionFailure::Decode(error)
+        | SessionFailure::Protocol(error)
+        | SessionFailure::Fatal(error) => truncate_error(error),
+    }
+}
+
+fn truncate_error(error: &anyhow::Error) -> String {
+    let mut message = format!("{error:#}");
+    const LIMIT: usize = 512;
+    if message.len() > LIMIT {
+        let mut end = LIMIT;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+        message.push('…');
+    }
+    message
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncates_errors_on_utf8_boundaries() {
+        let error = anyhow::anyhow!("x{}", "é".repeat(300));
+        let message = truncate_error(&error);
+        assert!(message.ends_with('…'));
+        assert!(message.len() <= 512 + '…'.len_utf8());
+    }
+}
