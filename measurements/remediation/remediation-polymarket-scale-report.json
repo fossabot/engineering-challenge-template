@@ -8,7 +8,7 @@
   "started_at_us": 1792790526156291,
   "ended_at_us": 1792790586788925,
   "shutdown_reason": "duration elapsed (60s)",
-  "output_path": "/private/var/folders/7c/m_f7hs9n445174c0x3gsy5kw0000gn/T/opencode/remediation/polymarket-scale.sbe",
+  "output_path": "captures/remediation/polymarket-scale.sbe",
   "shard_count": 2,
   "replica_count": 2,
   "discovered_symbols": 60,

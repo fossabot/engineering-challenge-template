@@ -8,7 +8,7 @@
   "started_at_us": 1792789875695284,
   "ended_at_us": 1792789905960872,
   "shutdown_reason": "duration elapsed (20s)",
-  "output_path": "/private/var/folders/7c/m_f7hs9n445174c0x3gsy5kw0000gn/T/opencode/remediation/polymarket-smoke.sbe",
+  "output_path": "captures/remediation/polymarket-smoke.sbe",
   "shard_count": 1,
   "replica_count": 2,
   "discovered_symbols": 4,
