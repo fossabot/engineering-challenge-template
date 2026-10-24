@@ -41,8 +41,10 @@ trait MessageSink: Send + 'static {
     /// Append one encoded message. A `Err` return is fatal: the worker stops
     /// and the error is surfaced through the handle.
     fn write(&mut self, message: &OutputMessage) -> anyhow::Result<()>;
-    /// Make accepted messages visible to readers (padding the chunk).
+    /// Make accepted messages visible without padding the current chunk.
     fn flush(&mut self) -> anyhow::Result<()>;
+    /// Finish the final chunk (padding it for file output) and flush.
+    fn finish(&mut self) -> anyhow::Result<()>;
     /// Persist flushed bytes to the storage layer where the sink supports it.
     fn sync(&mut self) -> anyhow::Result<()>;
     fn bytes_written(&self) -> u64;
@@ -56,7 +58,7 @@ enum Sink {
 impl Sink {
     fn open(path: &str, chunk_size: usize) -> anyhow::Result<Self> {
         if path == "-" {
-            let writer = BufWriter::with_capacity(chunk_size, std::io::stdout());
+            let writer = BufWriter::with_capacity(chunk_size.min(1 << 20), std::io::stdout());
             return Ok(Self::Stdout(AlignedSbeWriter::from_writer(
                 writer, chunk_size,
             )?));
@@ -91,6 +93,13 @@ impl MessageSink for Sink {
         match self {
             Self::File(writer) => writer.flush(),
             Self::Stdout(writer) => writer.flush(),
+        }
+    }
+
+    fn finish(&mut self) -> anyhow::Result<()> {
+        match self {
+            Self::File(writer) => writer.finish(),
+            Self::Stdout(writer) => writer.finish(),
         }
     }
 
@@ -184,7 +193,7 @@ impl WriterHandle {
                             let _ = ack.send(result);
                         }
                         WriterCommand::Shutdown(ack) => {
-                            let mut result = sink.flush().map_err(|error| format!("{error:#}"));
+                            let mut result = sink.finish().map_err(|error| format!("{error:#}"));
                             if result.is_ok() && sync_on_close {
                                 result = sink.sync().map_err(|error| format!("{error:#}"));
                             }
@@ -208,7 +217,7 @@ impl WriterHandle {
                 // empty by now, so drain-then-exit must uphold the same
                 // durability contract as an explicit shutdown command.
                 if !explicit_shutdown {
-                    if let Err(error) = sink.flush() {
+                    if let Err(error) = sink.finish() {
                         let text = format!("{error:#}");
                         error!(error = %text, "SBE writer final flush failed");
                         set_fatal(&writer_fatal, &text);
@@ -255,7 +264,8 @@ impl WriterHandle {
         }
     }
 
-    /// Flush the current partial chunk. This pads to the configured chunk size.
+    /// Flush currently encoded bytes without padding. The final chunk is
+    /// padded by [`WriterHandle::shutdown`].
     pub async fn flush(&self, timeout: Duration) -> anyhow::Result<()> {
         let (tx, rx) = oneshot::channel();
         match tokio::time::timeout(timeout, self.sender.send(WriterCommand::Flush(tx))).await {
@@ -481,7 +491,7 @@ impl DirectWriter {
     }
 
     pub fn shutdown(mut self) -> anyhow::Result<WriterStats> {
-        MessageSink::flush(&mut self.sink)?;
+        MessageSink::finish(&mut self.sink)?;
         if self.sync_on_close {
             MessageSink::sync(&mut self.sink)?;
         }
@@ -526,6 +536,7 @@ mod tests {
     struct FaultySink {
         fail_write_at: Option<usize>,
         fail_flush: bool,
+        fail_finish: bool,
         fail_sync: bool,
         writes: usize,
     }
@@ -535,6 +546,7 @@ mod tests {
             Self {
                 fail_write_at: None,
                 fail_flush: false,
+                fail_finish: false,
                 fail_sync: false,
                 writes: 0,
             }
@@ -553,6 +565,13 @@ mod tests {
         fn flush(&mut self) -> anyhow::Result<()> {
             if self.fail_flush {
                 anyhow::bail!("injected flush failure");
+            }
+            Ok(())
+        }
+
+        fn finish(&mut self) -> anyhow::Result<()> {
+            if self.fail_finish {
+                anyhow::bail!("injected finish failure");
             }
             Ok(())
         }
@@ -619,10 +638,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flush_failure_on_shutdown_is_reported() {
+    async fn finish_failure_on_shutdown_is_reported() {
         let writer = WriterHandle::start_with_sink(
             Box::new(FaultySink {
-                fail_flush: true,
+                fail_finish: true,
                 ..FaultySink::healthy()
             }),
             16,
@@ -633,9 +652,29 @@ mod tests {
         let _ = writer.send(update("sym"), TINY_TIMEOUT).await;
         let error = writer.shutdown(PATIENT_TIMEOUT).await.unwrap_err();
         assert!(
+            format!("{error:#}").contains("injected finish failure"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn periodic_flush_failure_is_reported() {
+        let writer = WriterHandle::start_with_sink(
+            Box::new(FaultySink {
+                fail_flush: true,
+                ..FaultySink::healthy()
+            }),
+            16,
+            false,
+            "unused",
+        )
+        .unwrap();
+        let error = writer.flush(PATIENT_TIMEOUT).await.unwrap_err();
+        assert!(
             format!("{error:#}").contains("injected flush failure"),
             "unexpected error: {error:#}"
         );
+        let _ = writer.shutdown(PATIENT_TIMEOUT).await;
     }
 
     #[tokio::test]
@@ -723,10 +762,10 @@ mod tests {
 
     #[tokio::test]
     async fn flush_makes_output_visible_to_reader() {
-        // Output-visibility contract: an accepted message is invisible to an
-        // independent reader until the next flush completes, and visible
-        // immediately after it. The coordinator flushes every
-        // `flush_interval_secs`, which bounds event-to-visible-output delay.
+        // Output-visibility contract: accepted messages reach the file after
+        // the next flush, without padding a whole chunk. A reader can decode
+        // the partial final chunk. Shutdown pads the final chunk so the
+        // template's default reader can decode the file too.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("visible.sbe");
         let path = path.to_str().unwrap();
@@ -743,8 +782,12 @@ mod tests {
         assert_eq!(std::fs::metadata(path).unwrap().len(), 0);
 
         writer.flush(PATIENT_TIMEOUT).await.unwrap();
-        let file_len = std::fs::metadata(path).unwrap().len();
-        assert!(file_len > 0, "flushed chunk must be visible on disk");
+        let visible_len = std::fs::metadata(path).unwrap().len();
+        assert!(visible_len > 0, "flushed bytes must be visible on disk");
+        assert!(
+            visible_len < 4096,
+            "a periodic flush must not pad a whole chunk (wrote {visible_len})"
+        );
 
         let mut reader =
             AlignedSbeReader::<OrderbookSchema>::open_with_chunk_size(path, 4096).unwrap();
@@ -752,7 +795,76 @@ mod tests {
         while reader.read_msg().unwrap().is_some() {
             decoded += 1;
         }
-        assert_eq!(decoded, 3);
+        assert_eq!(decoded, 3, "the partial chunk must be decodable");
+        drop(reader);
+
         writer.shutdown(PATIENT_TIMEOUT).await.unwrap();
+        assert_eq!(std::fs::metadata(path).unwrap().len(), 4096);
+    }
+
+    #[tokio::test]
+    async fn default_chunk_output_is_readable_by_default_reader() {
+        // The template's `AlignedSbeReader::open()` hardcodes a 64 MiB chunk.
+        // A default collector capture must therefore use the same chunk size
+        // and be padded on close, otherwise the provided helper decodes zero
+        // messages.
+        const TEMPLATE_CHUNK: usize = 64 << 20;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("template-default.sbe");
+        let path_str = path.to_str().unwrap();
+        let writer = WriterHandle::start(path_str, TEMPLATE_CHUNK, 16, false).unwrap();
+        for i in 0..3 {
+            writer
+                .send(update(&format!("sym-{i}")), TINY_TIMEOUT)
+                .await
+                .unwrap();
+        }
+        let stats = writer.shutdown_with_stats(PATIENT_TIMEOUT).await.unwrap();
+        assert_eq!(stats.messages, 3);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            TEMPLATE_CHUNK as u64,
+            "the final chunk must be padded to the template's chunk size"
+        );
+
+        let mut reader = AlignedSbeReader::<OrderbookSchema>::open(&path).unwrap();
+        let mut decoded = 0;
+        while reader.read_msg().unwrap().is_some() {
+            decoded += 1;
+        }
+        assert_eq!(
+            decoded, 3,
+            "template-default reader must decode all messages"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_sink_flushes_and_skips_invalid_fsync() {
+        // fsync on a FIFO returns EINVAL on Linux. A pipe output path must
+        // still flush and shut down cleanly, including when sync_on_close is
+        // enabled.
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe.sbe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let reader_path = fifo.clone();
+        let reader = tokio::task::spawn_blocking(move || {
+            let mut file = std::fs::File::open(&reader_path).unwrap();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            bytes.len()
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let writer = WriterHandle::start(fifo.to_str().unwrap(), 1024, 16, true).unwrap();
+        writer.send(update("fifo"), TINY_TIMEOUT).await.unwrap();
+        writer.flush(PATIENT_TIMEOUT).await.unwrap();
+        writer.shutdown(PATIENT_TIMEOUT).await.unwrap();
+        assert!(reader.await.unwrap() > 0);
     }
 }

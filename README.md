@@ -56,33 +56,32 @@ RUN_LIVE_TESTS=1 cargo test --test live_polymarket -- --ignored --nocapture
 Kalshi websocket order-book subscriptions require an API key and a private key.
 The collector supports Ed25519 PKCS#8, RSA PKCS#8, and RSA PKCS#1 PEM keys.
 Credentials are read from the TOML file, environment, or CLI; no secrets are
-written to reports or logs. The built-in environment default is `demo`;
-`production` must be selected explicitly. Startup logs state the exchange,
+written to reports or logs. The built-in environment default is `production`
+because the challenge targets live markets; use `--kalshi-environment demo`
+for the demo exchange and demo credentials. Startup logs state the exchange,
 environment, output, metadata, and report destinations.
 
 ```bash
 export KALSHI_API_KEY_ID="your-key-id"
 export KALSHI_PRIVATE_KEY_PATH="/absolute/path/to/kalshi-private-key.pem"
 
-# Demo is useful for validating the authenticated path.
 cargo run --release -- \
   --exchange kalshi \
-  --kalshi-environment demo \
-  --output captures/kalshi-demo.sbe \
-  --metadata captures/kalshi-demo-markets.json \
-  --report captures/kalshi-demo-report.json \
+  --kalshi-environment production \
+  --output captures/kalshi.sbe \
+  --metadata captures/kalshi-markets.json \
+  --report captures/kalshi-report.json \
   collect
 ```
 
-For production, use `--kalshi-environment production` and the production key.
 `KALSHI_PRIVATE_KEY_PEM` can be used instead of a path when a secret manager
-injects the PEM directly.
+injects the PEM directly. For the simulated exchange, add
+`--kalshi-environment demo` and use demo credentials.
 
 Discovery-only access does not need credentials:
 
 ```bash
-cargo run --release -- --exchange kalshi --kalshi-environment demo \
-  --max-markets 10 discover
+cargo run --release -- --exchange kalshi --max-markets 10 discover
 ```
 
 ### Kalshi mapping
@@ -218,8 +217,17 @@ exists, the local receive time is used.
 
 ## Output
 
-The output file is an aligned SBE stream, 64 KiB chunks by default. It is safe
-to inspect with:
+The output file is an aligned SBE stream with 64 MiB chunks by default, the
+same chunk size the template's `AlignedSbeReader::open()` expects. A periodic
+flush writes only the encoded bytes, without padding; the final chunk is
+zero-padded on a graceful close, so the closed capture is readable by both the
+supplied helper and `inspect`. The same format is used for stdout
+(`--output -`): redirect it to a file (`> capture.sbe`) when the template
+reader will consume it.
+
+A live capture may be read while it is being written: complete chunks decode
+normally, and the partial final chunk decodes up to its last complete message.
+It is safe to inspect with:
 
 ```bash
 cargo run --release -- inspect captures/polymarket.sbe --read-chunk-size auto
@@ -309,8 +317,8 @@ settings:
 | `collector.max_probes` | 3 | Probes before reconnect/failover |
 | `collector.final_snapshots` | true | Final snapshots on shutdown |
 | `collector.writer_queue` | 16384 | Bounded writer queue |
-| `collector.flush_interval_secs` | 1 | Output-visibility bound: every interval with traffic ends with a flush, so a downstream reader sees an accepted delta within about one second |
-| `output.chunk_size` | 65536 | Power-of-two aligned chunk |
+| `collector.flush_interval_secs` | 1 | Output-visibility bound: every interval with traffic ends with an unpadded flush, so a downstream reader sees an accepted delta within about one second |
+| `output.chunk_size` | 67108864 | Power-of-two chunk; defaults to 64 MiB for template-reader compatibility. Padding is written only on chunk rotation and at close |
 | `output.path` | `-` | File or binary stdout |
 
 ## Repository layout
@@ -339,11 +347,11 @@ measurements/         exact measured reports from public runs
 
 - Kalshi live validation requires credentials that are not checked into this
   repository. The authenticated path is implemented and covered by codec/auth
-  tests; a demo live run is the next validation step once credentials are
-  supplied.
-- In this environment, production Kalshi REST/WS endpoints were not reachable
-  reliably (connections reset), while the demo REST endpoint was reachable. The
-  adapter supports both; use demo for reproducible local validation.
+  and mock-websocket tests; a live run is the next validation step once
+  credentials are supplied.
+- Kalshi endpoint reachability depends on the environment. The adapter
+  supports production (the default) and demo; switch explicitly to demo for
+  simulated validation.
 - Polymarket is a public, best-effort feed with no sequence numbers. Recovery is
   reconnect-and-resubscribe. Its event timestamps are not a send-time clock.
 - `inspect --read-chunk-size auto` may select a smaller power-of-two chunk that

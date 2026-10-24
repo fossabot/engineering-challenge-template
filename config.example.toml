@@ -3,8 +3,9 @@
 exchange = "kalshi"
 
 [kalshi]
-# Demo is the built-in default. Set "production" explicitly for live data.
-environment = "demo"
+# Production is the built-in default because the challenge targets live
+# markets. Use "demo" with demo credentials for a simulated exchange.
+environment = "production"
 key_id = ""
 # private_key_path = "/absolute/path/to/kalshi-private-key.pem"
 batch_size = 100
@@ -34,10 +35,12 @@ duration_secs = 0
 writer_send_timeout_secs = 30
 
 [output]
-path = "captures/kalshi-demo.sbe"
-chunk_size = 65536
-metadata_path = "captures/kalshi-demo-markets.json"
-report_path = "captures/kalshi-demo-report.json"
+path = "captures/kalshi.sbe"
+# Matches the template reader's default. Periodic flushes write only encoded
+# bytes; the final chunk is padded on close.
+chunk_size = 67108864
+metadata_path = "captures/kalshi-markets.json"
+report_path = "captures/kalshi-report.json"
 sync_on_close = true
 
 [metrics]

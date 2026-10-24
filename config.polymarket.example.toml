@@ -31,7 +31,9 @@ writer_send_timeout_secs = 30
 
 [output]
 path = "captures/polymarket.sbe"
-chunk_size = 65536
+# 64 MiB matches the template AlignedSbeReader default. Flushes are
+# incremental; padding is written only at rotation and on close.
+chunk_size = 67108864
 metadata_path = "captures/polymarket-markets.json"
 report_path = "captures/polymarket-report.json"
 sync_on_close = true

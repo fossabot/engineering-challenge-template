@@ -90,15 +90,16 @@ impl<T: AlignedSbeSchema> AlignedSbeReader<T> {
 
     /// Create a new [`AlignedSbeReader`] from the file at `path`, with
     /// `chunk_size` for chunk size.
+    ///
+    /// The final chunk may be partial: this is the state of a capture while a
+    /// writer is running, or after a crash. Complete chunks are decoded
+    /// normally; a partial tail is decoded up to its last complete message.
+    /// After a graceful close the file is padded to whole chunks and the
+    /// template's default reader can read it.
     pub fn open_with_chunk_size(path: impl AsRef<Path>, chunk_size: usize) -> anyhow::Result<Self> {
         let file = File::open(path)?;
         let file_len = file.metadata()?.len();
         anyhow::ensure!(chunk_size >= 1024, "chunk size must be at least 1024");
-        anyhow::ensure!(
-            file_len == 0 || file_len % chunk_size as u64 == 0,
-            "file length {file_len} is not a multiple of chunk size {chunk_size}; \
-             pass the writer's exact chunk size or use --chunk-size auto"
-        );
 
         Ok(Self {
             file: Some(file),
@@ -144,13 +145,13 @@ impl<T: AlignedSbeSchema> AlignedSbeReader<T> {
             let mut file_offset = 0u64;
 
             loop {
-                let Some(end) = file_offset.checked_add(chunk_size as u64) else {
-                    return;
-                };
-                if end > file_len {
+                let remaining = file_len.saturating_sub(file_offset);
+                if remaining == 0 {
                     let _ = ready_chunks_tx.send(Ok(None));
                     return;
                 }
+                let take = usize::try_from(remaining.min(chunk_size as u64))
+                    .expect("chunk size fits usize");
 
                 let mut buffer = match spare_buffers.next() {
                     Some(buffer) => buffer,
@@ -159,6 +160,8 @@ impl<T: AlignedSbeSchema> AlignedSbeReader<T> {
                         Err(_) => return,
                     },
                 };
+                // Recycle short buffers produced by an earlier partial tail.
+                buffer.resize(take, 0);
                 if let Err(error) = file.read_exact_at(&mut buffer, file_offset) {
                     let _ = ready_chunks_tx.send(Err(error));
                     return;
@@ -166,7 +169,7 @@ impl<T: AlignedSbeSchema> AlignedSbeReader<T> {
                 if ready_chunks_tx.send(Ok(Some(buffer))).is_err() {
                     return;
                 }
-                file_offset = end;
+                file_offset += take as u64;
             }
         }))
     }
@@ -207,21 +210,24 @@ impl<T: AlignedSbeSchema> AlignedSbeReader<T> {
             };
         }
 
-        let end = self
-            .file_offset
-            .checked_add(self.chunk_size as u64)
-            .context("offset overflow")?;
-        if end > self.file_len {
+        let remaining = self.file_len.saturating_sub(self.file_offset);
+        if remaining == 0 {
+            self.eof = true;
             return Ok(false);
         }
-
+        let take =
+            usize::try_from(remaining.min(self.chunk_size as u64)).expect("chunk size fits usize");
+        self.buffer.resize(take, 0);
         self.file
             .as_ref()
             .context("file moved to prefetch task")?
             .read_exact_at(&mut self.buffer, self.file_offset)?;
 
-        self.file_offset = end;
+        self.file_offset += take as u64;
         self.buffer_pos = 0;
+        if self.file_offset >= self.file_len {
+            self.eof = true;
+        }
 
         Ok(true)
     }
@@ -288,8 +294,8 @@ impl<T: AlignedSbeSchema> AlignedSbeReader<T> {
     }
 }
 
-/// Scan power-of-two chunk sizes and return the smallest one whose every chunk
-/// boundary is a valid SBE stream.
+/// Scan power-of-two chunk sizes and return the one whose complete chunks are
+/// valid SBE streams with a valid (possibly partial) final chunk.
 pub fn detect_chunk_size<T: AlignedSbeSchema>(bytes: &[u8]) -> anyhow::Result<usize> {
     if bytes.is_empty() {
         return Ok(DEFAULT_CHUNK_SIZE);
@@ -297,14 +303,15 @@ pub fn detect_chunk_size<T: AlignedSbeSchema>(bytes: &[u8]) -> anyhow::Result<us
 
     let mut best: Option<(usize, usize)> = None; // (chunk size, message count)
     let mut chunk = 1024usize;
-    while chunk <= bytes.len() {
-        if bytes.len().is_multiple_of(chunk) {
-            match validate_aligned::<T>(bytes, chunk) {
-                Ok(count) if count > 0 && best.is_none_or(|(_, best_count)| count > best_count) => {
-                    best = Some((chunk, count));
-                }
-                _ => {}
+    // Include one candidate at or above the file length so a capture whose
+    // final chunk has not been padded yet is still decodable.
+    let limit = bytes.len().next_power_of_two().max(1024);
+    while chunk <= limit {
+        match validate_aligned::<T>(bytes, chunk) {
+            Ok(count) if count > 0 && best.is_none_or(|(_, best_count)| count > best_count) => {
+                best = Some((chunk, count));
             }
+            _ => {}
         }
         chunk = chunk.saturating_mul(2);
     }
@@ -323,16 +330,20 @@ pub fn detect_chunk_size<T: AlignedSbeSchema>(bytes: &[u8]) -> anyhow::Result<us
 fn validate_aligned<T: AlignedSbeSchema>(bytes: &[u8], chunk: usize) -> anyhow::Result<usize> {
     let mut total = 0usize;
     for start in (0..bytes.len()).step_by(chunk) {
-        let end = start + chunk;
+        let end = (start + chunk).min(bytes.len());
         let mut pos = 0usize;
-        while pos < chunk {
+        while start + pos < end {
             let offset = start + pos;
             let remaining = end - offset;
             if remaining < HEADER_LENGTH {
-                anyhow::bail!("truncated header");
+                // Fewer than a header: a partial tail, not an error.
+                break;
             }
             let header = &bytes[offset..offset + HEADER_LENGTH];
             if header == [0; HEADER_LENGTH] {
+                // A sentinel must be followed only by zero padding through the
+                // end of this chunk. In a partial final chunk the sentinel is
+                // the last data byte.
                 anyhow::ensure!(
                     bytes[offset..end].iter().all(|byte| *byte == 0),
                     "non-zero bytes after the chunk sentinel"

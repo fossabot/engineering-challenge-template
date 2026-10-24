@@ -41,7 +41,9 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "FILE")]
     pub output: Option<String>,
 
-    #[arg(long, global = true)]
+    /// Aligned output chunk size. Defaults to 64 MiB, matching the template
+    /// `AlignedSbeReader`. Must be a power of two of at least 1024 bytes.
+    #[arg(long, global = true, value_name = "BYTES")]
     pub chunk_size: Option<usize>,
 
     #[arg(long, global = true)]

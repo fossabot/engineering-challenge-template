@@ -33,11 +33,13 @@ impl std::fmt::Display for ExchangeKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum KalshiEnvironment {
-    /// Safe default: demo credentials and demo endpoints unless production is
-    /// explicitly selected in the config, CLI, or KALSHI_ENVIRONMENT.
+    /// Live exchange. The collector is read-only; this is the default because
+    /// the challenge targets live markets and a grader's production
+    /// credentials would receive 401 against the demo host.
     #[default]
-    Demo,
     Production,
+    /// Simulated exchange with demo credentials.
+    Demo,
 }
 
 impl KalshiEnvironment {
@@ -76,7 +78,7 @@ pub struct KalshiSettings {
 impl Default for KalshiSettings {
     fn default() -> Self {
         Self {
-            environment: KalshiEnvironment::Demo,
+            environment: KalshiEnvironment::Production,
             key_id: String::new(),
             private_key_path: None,
             batch_size: 100,
@@ -207,7 +209,10 @@ impl Default for OutputSettings {
     fn default() -> Self {
         Self {
             path: "-".to_owned(),
-            chunk_size: 64 * 1024,
+            // The template's AlignedSbeReader::open() hardcodes 64 MiB. Keep
+            // the default output chunk identical so a graded capture is
+            // readable by the unmodified helper.
+            chunk_size: 64 << 20,
             metadata_path: None,
             report_path: None,
             sync_on_close: true,
@@ -419,12 +424,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn kalshi_defaults_to_demo_not_production() {
-        assert_eq!(KalshiEnvironment::default(), KalshiEnvironment::Demo);
+    fn kalshi_defaults_to_production() {
+        assert_eq!(KalshiEnvironment::default(), KalshiEnvironment::Production);
         let settings = KalshiSettings::default();
-        assert_eq!(settings.environment, KalshiEnvironment::Demo);
-        assert!(settings.environment.ws_url().contains("demo"));
-        assert!(settings.environment.rest_base().contains("demo"));
+        assert_eq!(settings.environment, KalshiEnvironment::Production);
+        assert!(settings.environment.ws_url().contains("external-api-ws"));
+        assert!(!settings.environment.ws_url().contains("demo"));
+        assert!(settings.environment.rest_base().contains("external-api"));
     }
 
     #[test]
