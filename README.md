@@ -8,8 +8,7 @@ Kalshi is the primary exchange adapter. Polymarket's public CLOB market channel
 is included as a working fallback and as a public, credential-free way to
 validate the transport, sharding, snapshot, replay, and inspection paths.
 
-See the [requirement-to-test matrix](docs/requirement-test-matrix.md) for the
-challenge-to-evidence map, and
+See the [requirement-to-test matrix](docs/requirement-test-matrix.md) and
 [final verification](docs/final-verification-2026-10-25.md) for the exact
 offline gate results.
 
@@ -51,8 +50,7 @@ cargo build --release --locked
 
 The final local CI-equivalent run has **127 passing offline tests**: 118
 library tests, 7 mock-exchange end-to-end tests, and 2 replay integration tests.
-The public Polymarket network test is separate and ignored by default. Exact
-commands, counts, and the CI status are recorded in
+Exact commands, counts, and the CI status are recorded in
 [`docs/final-verification-2026-10-25.md`](docs/final-verification-2026-10-25.md).
 
 The offline suite covers decoding, fixed-point arithmetic, order books,
@@ -75,7 +73,7 @@ Kalshi websocket order-book subscriptions require an API key and a private key.
 The collector supports Ed25519 PKCS#8, RSA PKCS#8, and RSA PKCS#1 PEM keys.
 Credentials are read from the TOML file, environment, or CLI; no secrets are
 written to reports or logs. The built-in environment default is `production`
-because the challenge targets live markets; use `--kalshi-environment demo`
+because the collector targets live markets; use `--kalshi-environment demo`
 for the demo exchange and demo credentials. Startup logs state the exchange,
 environment, output, metadata, and report destinations.
 
@@ -275,8 +273,9 @@ exists, the local receive time is used.
   the wall clock. Replay uses fixture timestamps so the core remains
   deterministic.
 - No bounded reordering buffer is implemented. Global chronological output is
-  not a contract; a consumer that needs a sorted stream must buffer downstream
-  with an explicit delay.
+  not a contract; sorting a capture by timestamp is not equivalent to
+  replaying it, so a consumer that needs a sorted stream must buffer
+  downstream with an explicit delay.
 
 Deterministic tests:
 `collector::state::tests::snapshot_anchors_delta_application_in_per_symbol_order`,
@@ -337,20 +336,19 @@ describe one complete book history (a lost, duplicated, or out-of-order delta),
 so the command exits non-zero and reports the offending symbols with samples.
 `unknown_messages` (the schema allows template ids this collector never emits)
 and deltas that arrive before their symbol's first snapshot also fail
-verification; the check is deliberately strict because a silently inconsistent
-backtest is worse than a failed capture. An empty snapshot is treated as a
+verification; the check is strict because a silently inconsistent backtest is
+worse than a failed capture. An empty snapshot is treated as a
 retirement/empty-book boundary rather than a mismatch: it carries no level
 evidence, so it cannot prove that a suppressed update was observed. Only a
 later non-empty snapshot can expose a gap.
 
 ### Capture completeness and the mock exchange
 
-`tests/e2e_mock_exchange.rs` is an independent oracle test, not another unit
-test of the core. It starts loopback Gamma keyset and Polymarket WebSocket
-servers, drives `coordinator::run_with_shutdown`, and reads the resulting SBE
-file through the same reader used by `inspect`/`verify`. The mock exchange owns
-the authoritative book and a full delivered-update history. The seven scenarios
-are:
+`tests/e2e_mock_exchange.rs` starts loopback Gamma keyset and Polymarket
+WebSocket servers, drives `coordinator::run_with_shutdown`, and reads the
+resulting SBE file through the same reader used by `inspect`/`verify`. The mock
+exchange owns the authoritative book and a full delivered-update history. The
+seven scenarios are:
 
 1. steady state: every delivered update and resulting book matches the mock
    history, not only the final book;
@@ -367,20 +365,17 @@ are:
 7. subscription scale: 1,000 symbols, 4 shards, 2 replicas, 8 WebSockets, 250
    symbols per socket, and 2,000 subscription entries.
 
-The mock exchange is the completeness oracle for these scenarios. `verify` is a
-capture self-consistency check, not a proof that no update was missed. The
-full-outage and negative-control tests deliberately assert that `verify` is
-invalid.
+The mock exchange is the completeness oracle for these scenarios; `verify`
+checks only capture self-consistency. The full-outage and negative-control
+tests assert that `verify` is invalid.
 
-The scale test is the tested operating envelope, not a live capacity claim. The
-548,942-token discovery sweep proves keyset discovery only; it does not prove
-simultaneous subscription or collection at that fan-out. Configured bounds are
-up to 256 shards, 4 replicas, `max_symbols_per_socket = 5,000`, and
-`max_shards = 64` for automatic sharding.
+The scale test is the tested operating envelope. The 548,942-token sweep is
+discovery evidence, not subscription evidence at that fan-out; configured
+bounds are not measured live capacity.
 
 ## Latency experiments (Extension 4)
 
-The `latency` command measures, without inventing values:
+The `latency` command measures:
 
 1. **Discovery RTT** — wall-clock time around one discovery call.
 2. **Exchange-to-local timestamp latency** — `local_receive_us -
@@ -431,8 +426,9 @@ window; the raw reports are checked in under `measurements/`:
 | Arrival skew p50 | 65 µs | 59 µs | 67,845 µs | 10,543 µs |
 | Arrival skew p95 | 27,004 µs | 5,496 µs | 74,093 µs | 15,280 µs |
 
-These are four single 60-second observations, not benchmarks, guarantees, or
-causal identification. The cross-connection arrival skew is the
+These are four single 60-second observations on one network path, not
+controlled benchmarks across networks or colocated hosts, and not causal
+identification. The cross-connection arrival skew is the
 clock-independent number: two sockets on this host usually saw the same update
 within tens of microseconds, and racing four full handshakes selected a faster
 connection in these runs. Source-port pinning was the *worst* configuration in
@@ -461,6 +457,8 @@ settings:
 |---|---:|---|
 | `collector.shards` | 4 | Fixed shard count; `0` derives it |
 | `collector.replicas` | 2 | Redundant sockets per shard |
+| `collector.max_symbols_per_socket` | 5000 | Soft capacity used to derive shards when `collector.shards = 0` |
+| `collector.max_shards` | 64 | Upper bound when deriving shards automatically |
 | `collector.snapshot_interval_secs` | 60 | Full local snapshot cadence |
 | `collector.discovery_interval_secs` | 30 | Discovery reconciliation cadence |
 | `collector.reconnect_after_secs` | 1800 | Periodic socket refresh |
@@ -527,19 +525,6 @@ measurements/         exact measured reports from public runs
   `--read-chunk-size`. Auto-detection may select a smaller power-of-two chunk
   that also validates the file, so pass the writer's exact `--chunk-size` when
   the exact chunk size matters.
-- The latency tables are four short public-feed observations, not controlled
-  benchmarks across networks or colocated hosts. Source-port/CDN hashing and
-  Nagle/delayed-ACK explanations are hypotheses, not causal findings.
-- The 548,942-token full-universe sweep is a discovery result, not a
-  simultaneous-subscription result. The tested subscription envelope is 1,000
-  loopback symbols across 4 shards and 2 replicas; configured limits are not
-  measured live capacity.
-- Global chronological output is not a contract. File order is processing order
-  and preserves actual receive timestamps; timestamp sorting can reorder
-  cross-source events and is not equivalent to replaying the capture.
-- GitHub Actions has not run successfully from this environment because the
-  account is billing-locked. The local CI-equivalent gates pass; CI is not
-  claimed green.
 
 ## License
 

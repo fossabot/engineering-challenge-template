@@ -95,11 +95,9 @@ skew and is retained as history.
 | First arrivals (replica 0 / 1) | 36 / 140 | 196 / 20 | 8 / 346 | 36 / 360 |
 | Timestamp-latency p50 | 229,524 µs | 147,670 µs | 192,387 µs | 179,050 µs |
 
-These are four single 60-second observations, not a controlled benchmark and
-not a causal experiment. The four runs happened at different minutes of the same
-day on the same network, so network conditions varied between them. Each
-configuration was measured once. The findings below distinguish what the
-samples show from mechanisms that remain hypotheses.
+The four runs happened at different minutes of the same day on the same
+network, so network conditions varied between them. Each configuration was
+measured once.
 
 ## Findings
 
@@ -136,8 +134,7 @@ samples show from mechanisms that remain hypotheses.
    which small order-book frames wait for coalescing, but the runs did not
    capture packet-level evidence or control for network variation.
    `TCP_NODELAY` remains the default because it avoids one plausible source of
-   delay at negligible cost; that is a design choice, not a proven causal
-   result from these four observations.
+   delay at negligible cost.
 5. **The venue's initial dump treats the second identical subscription
    differently.** Replica 0's first frame consistently arrived ~3 ms after its
    task started, while replica 1 — subscribed to exactly the same assets a
@@ -154,11 +151,10 @@ samples show from mechanisms that remain hypotheses.
    (authentication) rejection. A retried handshake cannot bias any reported
    value because the measurement window starts only after every session is
    connected.
-7. **Timestamp latency remains dominated by clock offset and venue semantics.**
+7. **Timestamp latency is dominated by clock offset and venue semantics.**
    The `local_receive_us - exchange_timestamp_us` p50 across runs was
-   148–230 ms with a p99 up to 511 ms. This includes exchange/local clock
-   offset and Polymarket's event-timestamp semantics, so it is not a network
-   latency measurement; the cross-connection skew is the number to read.
+   148–230 ms with a p99 up to 511 ms, so it is not a network latency
+   measurement; the cross-connection skew is the number to read.
 
 ## Interpretation and caveats
 
@@ -167,8 +163,6 @@ samples show from mechanisms that remain hypotheses.
 - Polymarket's `timestamp` is an exchange event timestamp, not a guaranteed
   send-time clock. A nonzero clock offset between the exchange and this host is
   included in every sample.
-- All runs used the public internet from a laptop, not a colocated host, and
-  each configuration was measured once.
 - Discovery RTT (0.7–5.0 s across these runs, and ~9m52s for the full
   2,746-page universe sweep) includes Gamma pagination and JSON decoding; it is
   not a websocket handshake measurement.
