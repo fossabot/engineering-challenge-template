@@ -65,7 +65,10 @@ RUN_LIVE_TESTS=1 cargo test --test live_polymarket -- --ignored --nocapture
 
 The GitHub Actions workflow runs the same gates on every push; run
 [40166110564](https://github.com/kj111422/engineering-challenge-template/actions/runs/40166110564)
-passed all steps on `ubuntu-latest`.
+passed all steps on `ubuntu-latest`. The manual live public-feed workflow
+passed in run
+[40168059177](https://github.com/kj111422/engineering-challenge-template/actions/runs/40168059177),
+executing the opt-in Polymarket integration test against the live venue.
 
 ## Quick start: Kalshi
 

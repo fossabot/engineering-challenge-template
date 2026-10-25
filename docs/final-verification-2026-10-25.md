@@ -113,8 +113,10 @@ workflow runs on every push; run
 [40166110564](https://github.com/kj111422/engineering-challenge-template/actions/runs/40166110564)
 passed all steps on `ubuntu-latest`: format check, clippy with `-D warnings`,
 `cargo test --all-targets --locked`, documentation tests, and the release
-build. The live public-feed workflow is manual (`workflow_dispatch`) and was
-not triggered as part of this gate.
+build. The live public-feed workflow is manual (`workflow_dispatch`); run
+[40168059177](https://github.com/kj111422/engineering-challenge-template/actions/runs/40168059177)
+passed, running the opt-in public Polymarket discovery and websocket
+subscription test against the live venue from a GitHub runner.
 
 ## Count reconciliation
 
