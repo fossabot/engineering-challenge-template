@@ -513,6 +513,9 @@ measurements/         exact measured reports from public runs
   repository. The authenticated path is implemented and covered by codec/auth
   and mock-websocket tests; a live run is the next validation step once
   credentials are supplied.
+- No geographic or access restriction was bypassed. Kalshi live validation
+  remains blocked without authorized credentials; Polymarket is used only as
+  the permitted public fallback.
 - Kalshi endpoint reachability depends on the environment. The adapter
   supports production (the default) and demo; switch explicitly to demo for
   simulated validation.
