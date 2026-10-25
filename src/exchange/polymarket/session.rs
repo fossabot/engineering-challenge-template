@@ -12,33 +12,46 @@ use reqwest::Client;
 use serde_json::json;
 
 use crate::{
-    config::PolymarketSettings,
+    config::{NetworkSettings, PolymarketSettings},
     exchange::polymarket::codec::decode_polymarket_message,
     model::SourceId,
     session::{MarketDataSession, SessionFactory, SessionFailure, SessionFrame},
     time::now_us,
-    ws::{self, WsPayload, WsStream},
+    ws::{self, ConnectOptions, WsPayload, WsStream},
 };
 
 pub struct PolymarketExchange {
     pub(crate) settings: PolymarketSettings,
     pub(crate) client: Client,
+    pub(crate) network: NetworkSettings,
 }
 
 pub type PolymarketSessionFactory = PolymarketExchange;
 
 #[async_trait]
 impl SessionFactory for PolymarketExchange {
-    async fn create_session(
-        &self,
-        _source: SourceId,
-    ) -> anyhow::Result<Box<dyn MarketDataSession>> {
-        Ok(Box::new(PolymarketSession::new(self.settings.clone())))
+    async fn create_session(&self, source: SourceId) -> anyhow::Result<Box<dyn MarketDataSession>> {
+        let connect_options = self
+            .network
+            .connect_options()
+            .for_ordinal(source_ordinal(source))
+            .with_context(|| format!("deriving connect options for source {source}"))?;
+        Ok(Box::new(PolymarketSession::new(
+            self.settings.clone(),
+            connect_options,
+        )))
     }
+}
+
+/// Unique per-connection ordinal used to derive distinct pinned source ports.
+/// Mirrors the Kalshi adapter so pinned ports behave identically per venue.
+fn source_ordinal(source: SourceId) -> u32 {
+    u32::from(source.shard) * 256 + u32::from(source.replica)
 }
 
 pub struct PolymarketSession {
     settings: PolymarketSettings,
+    connect_options: ConnectOptions,
     stream: Option<WsStream>,
     desired: BTreeSet<String>,
     subscribed_assets: BTreeSet<String>,
@@ -49,9 +62,10 @@ pub struct PolymarketSession {
 }
 
 impl PolymarketSession {
-    fn new(settings: PolymarketSettings) -> Self {
+    fn new(settings: PolymarketSettings, connect_options: ConnectOptions) -> Self {
         Self {
             settings,
+            connect_options,
             stream: None,
             desired: BTreeSet::new(),
             subscribed_assets: BTreeSet::new(),
@@ -112,7 +126,7 @@ impl PolymarketSession {
 impl MarketDataSession for PolymarketSession {
     async fn connect(&mut self) -> Result<(), SessionFailure> {
         self.close().await;
-        let stream = ws::connect(&self.settings.ws_url, &[])
+        let stream = ws::connect(&self.settings.ws_url, &[], &self.connect_options)
             .await
             .map_err(|error| {
                 SessionFailure::Reconnect(error.context("connecting to Polymarket websocket"))

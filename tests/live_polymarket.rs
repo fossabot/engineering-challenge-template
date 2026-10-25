@@ -22,7 +22,13 @@ async fn discovers_and_subscribes_to_public_polymarket_books() {
         "set RUN_LIVE_TESTS=1 to run the public-feed integration test"
     );
 
-    let exchange = Arc::new(PolymarketExchange::new(PolymarketSettings::default()).unwrap());
+    let exchange = Arc::new(
+        PolymarketExchange::new(
+            PolymarketSettings::default(),
+            engineering_challenge::config::NetworkSettings::default(),
+        )
+        .unwrap(),
+    );
     let markets = timeout(Duration::from_secs(30), exchange.discover_markets(5))
         .await
         .expect("discovery timed out")

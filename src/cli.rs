@@ -37,6 +37,23 @@ pub struct Cli {
     #[arg(long = "kalshi-private-key", global = true, value_name = "FILE")]
     pub kalshi_private_key: Option<PathBuf>,
 
+    /// Disable TCP_NODELAY on websocket sockets.
+    #[arg(long = "no-tcp-nodelay", global = true)]
+    pub no_tcp_nodelay: bool,
+
+    /// Bind websocket connections to this local IP address.
+    #[arg(long = "source-ip", global = true, value_name = "IP")]
+    pub source_ip: Option<std::net::IpAddr>,
+
+    /// Bind websocket connections to this local source port. The value is a
+    /// base: each connection binds `base + shard * 256 + replica`.
+    #[arg(long = "source-port", global = true, value_name = "PORT")]
+    pub source_port: Option<u16>,
+
+    /// Race this many simultaneous websocket handshakes and keep the first.
+    #[arg(long = "connect-race", global = true, value_name = "N")]
+    pub connect_race: Option<usize>,
+
     /// Output file, or `-` for binary stdout.
     #[arg(long, global = true, value_name = "FILE")]
     pub output: Option<String>,
@@ -105,6 +122,15 @@ pub enum Command {
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
+    /// Verify that a capture's deltas reconstruct the next snapshots exactly.
+    Verify {
+        /// Capture path.
+        #[arg(value_name = "SBE")]
+        input: PathBuf,
+        /// Chunk size in bytes, or `auto`.
+        #[arg(long = "read-chunk-size", default_value = "auto")]
+        read_chunk_size: String,
+    },
     /// Measure discovery RTT and websocket timestamp latency.
     Latency {
         /// Optional path for the JSON latency report.
@@ -132,6 +158,18 @@ impl Cli {
         }
         if let Some(path) = &self.kalshi_private_key {
             settings.kalshi.private_key_path = Some(path.clone());
+        }
+        if self.no_tcp_nodelay {
+            settings.network.tcp_nodelay = false;
+        }
+        if let Some(source_ip) = self.source_ip {
+            settings.network.source_ip = Some(source_ip);
+        }
+        if let Some(source_port) = self.source_port {
+            settings.network.source_port = Some(source_port);
+        }
+        if let Some(connect_race) = self.connect_race {
+            settings.network.connect_race = connect_race;
         }
         if let Some(output) = &self.output {
             settings.output.path = output.clone();

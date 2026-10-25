@@ -4,14 +4,15 @@
 //! environment variables, then explicit CLI flags.
 
 use std::{
-    net::SocketAddr,
-    path::{Path, PathBuf},
+    net::{IpAddr, SocketAddr},
+    path::{Component, Path, PathBuf},
     time::Duration,
 };
 
 use anyhow::{Context, bail};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -97,12 +98,16 @@ pub struct PolymarketSettings {
     /// Number of asset ids per dynamic subscribe/unsubscribe frame. The
     /// initial snapshot subscription is always sent as one frame.
     pub batch_size: usize,
-    /// Gamma API page size.
+    /// Gamma keyset page size. The endpoint accepts at most 100 records.
     pub discovery_page_size: usize,
     pub request_timeout_secs: u64,
     /// Delay between discovery pages.
     pub discovery_page_delay_ms: u64,
-    /// Only include books that are currently accepting orders.
+    /// Require an explicit `acceptingOrders == true`.
+    ///
+    /// A missing field is unconfirmed and is excluded while this is enabled.
+    /// Disable it to include records whose accepting state is unknown, while
+    /// retaining the active/closed/archived/order-book filters.
     pub require_accepting_orders: bool,
 }
 
@@ -112,7 +117,7 @@ impl Default for PolymarketSettings {
             gamma_url: "https://gamma-api.polymarket.com".to_owned(),
             ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market".to_owned(),
             batch_size: 500,
-            discovery_page_size: 500,
+            discovery_page_size: 100,
             request_timeout_secs: 20,
             discovery_page_delay_ms: 50,
             require_accepting_orders: true,
@@ -227,6 +232,55 @@ pub struct MetricsSettings {
     pub listen: Option<SocketAddr>,
 }
 
+/// Transport controls shared by every websocket adapter.
+///
+/// These options exist for latency experiments as well as production tuning.
+/// The defaults are conservative: Nagle's algorithm is disabled because
+/// order-book frames are small and latency-sensitive, and a single connection
+/// attempt is made.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NetworkSettings {
+    /// Set `TCP_NODELAY` on every accepted websocket TCP socket.
+    pub tcp_nodelay: bool,
+    /// Optional local IP to bind before connecting. The address family must
+    /// match the resolved remote address.
+    pub source_ip: Option<IpAddr>,
+    /// Optional fixed local source port, used as a base: connection
+    /// `shard * 256 + replica` binds `base + ordinal`, so parallel
+    /// connections never collide. Cannot be combined with `connect_race > 1`,
+    /// because racing attempts for one connection would share one port.
+    pub source_port: Option<u16>,
+    /// Number of simultaneous TCP/TLS/websocket handshakes. The first
+    /// successful connection is retained and the rest are closed. One means
+    /// no racing.
+    pub connect_race: usize,
+}
+
+impl Default for NetworkSettings {
+    fn default() -> Self {
+        Self {
+            tcp_nodelay: true,
+            source_ip: None,
+            source_port: None,
+            connect_race: 1,
+        }
+    }
+}
+
+impl NetworkSettings {
+    /// Convert validated settings into transport options.
+    #[must_use]
+    pub fn connect_options(&self) -> crate::ws::ConnectOptions {
+        crate::ws::ConnectOptions {
+            tcp_nodelay: self.tcp_nodelay,
+            source_ip: self.source_ip,
+            source_port: self.source_port,
+            attempts: self.connect_race,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FileConfig {
@@ -234,6 +288,7 @@ pub struct FileConfig {
     pub kalshi: KalshiSettings,
     pub polymarket: PolymarketSettings,
     pub collector: CollectorSettings,
+    pub network: NetworkSettings,
     pub output: OutputSettings,
     pub metrics: MetricsSettings,
 }
@@ -244,6 +299,7 @@ pub struct Settings {
     pub kalshi: KalshiSettings,
     pub polymarket: PolymarketSettings,
     pub collector: CollectorSettings,
+    pub network: NetworkSettings,
     pub output: OutputSettings,
     pub metrics: MetricsSettings,
 }
@@ -264,6 +320,7 @@ impl Settings {
             kalshi: file.kalshi,
             polymarket: file.polymarket,
             collector: file.collector,
+            network: file.network,
             output: file.output,
             metrics: file.metrics,
         };
@@ -352,38 +409,23 @@ impl Settings {
             "flush_interval_secs must be >= 1"
         );
         anyhow::ensure!(
+            (1..=8).contains(&self.network.connect_race),
+            "network.connect_race must be in [1, 8]"
+        );
+        anyhow::ensure!(
+            self.network.source_port != Some(0),
+            "network.source_port must be non-zero"
+        );
+        anyhow::ensure!(
+            self.network.connect_race == 1 || self.network.source_port.is_none(),
+            "network.source_port cannot be combined with connect_race > 1"
+        );
+        anyhow::ensure!(
             self.output.chunk_size >= 1024 && self.output.chunk_size.is_power_of_two(),
             "output.chunk_size must be a power of two >= 1024"
         );
         anyhow::ensure!(!self.output.path.is_empty(), "output path is empty");
-        if let Some(path) = &self.output.metadata_path {
-            anyhow::ensure!(
-                path.as_os_str() != self.output.path.as_str(),
-                "metadata_path must differ from output.path"
-            );
-            anyhow::ensure!(
-                path.as_os_str() != "-",
-                "metadata_path must be a file path, not stdout"
-            );
-        }
-        if let Some(path) = &self.output.report_path {
-            anyhow::ensure!(
-                path.as_os_str() != self.output.path.as_str(),
-                "report_path must differ from output.path"
-            );
-            anyhow::ensure!(
-                path.as_os_str() != "-",
-                "report_path must be a file path, not stdout"
-            );
-        }
-        if let (Some(metadata), Some(report)) =
-            (&self.output.metadata_path, &self.output.report_path)
-        {
-            anyhow::ensure!(
-                metadata != report,
-                "metadata_path and report_path must differ"
-            );
-        }
+        validate_output_paths(self)?;
         anyhow::ensure!(
             self.kalshi.batch_size >= 1 && self.kalshi.batch_size <= 1000,
             "kalshi.batch_size must be in [1, 1000]"
@@ -397,19 +439,33 @@ impl Settings {
             "polymarket.batch_size must be >= 1"
         );
         anyhow::ensure!(
-            self.polymarket.discovery_page_size >= 1,
-            "polymarket.discovery_page_size must be >= 1"
+            self.polymarket.discovery_page_size >= 1 && self.polymarket.discovery_page_size <= 100,
+            "polymarket.discovery_page_size must be in [1, 100]"
         );
-        for (name, url) in [
-            ("polymarket.gamma_url", &self.polymarket.gamma_url),
-            ("polymarket.ws_url", &self.polymarket.ws_url),
-        ] {
-            url::Url::parse(url).with_context(|| format!("invalid {name}"))?;
-        }
-        url::Url::parse(self.kalshi.environment.rest_base())
-            .context("invalid Kalshi REST base URL")?;
-        url::Url::parse(self.kalshi.environment.ws_url())
-            .context("invalid Kalshi websocket URL")?;
+        validate_endpoint(
+            "polymarket.gamma_url",
+            &self.polymarket.gamma_url,
+            "https",
+            Some("http"),
+        )?;
+        validate_endpoint(
+            "polymarket.ws_url",
+            &self.polymarket.ws_url,
+            "wss",
+            Some("ws"),
+        )?;
+        validate_endpoint(
+            "Kalshi REST base URL",
+            self.kalshi.environment.rest_base(),
+            "https",
+            None,
+        )?;
+        validate_endpoint(
+            "Kalshi websocket URL",
+            self.kalshi.environment.ws_url(),
+            "wss",
+            None,
+        )?;
         Ok(())
     }
 
@@ -417,6 +473,169 @@ impl Settings {
     pub fn discovery_interval(&self) -> Duration {
         Duration::from_secs(self.collector.discovery_interval_secs)
     }
+}
+
+/// Validate a network endpoint without assuming a particular hostname.
+///
+/// Production endpoints must use TLS. Plain HTTP/WS is accepted only for a
+/// loopback host, which keeps local integration tests possible without
+/// permitting accidental plaintext traffic to a remote exchange or proxy.
+fn validate_endpoint(
+    name: &str,
+    value: &str,
+    secure_scheme: &str,
+    plain_scheme: Option<&str>,
+) -> anyhow::Result<Url> {
+    let url = Url::parse(value).with_context(|| format!("invalid {name}"))?;
+    anyhow::ensure!(!url.cannot_be_a_base(), "{name} must be a hierarchical URL");
+    anyhow::ensure!(
+        url.host_str().is_some_and(|host| !host.is_empty()),
+        "{name} must include a host"
+    );
+    anyhow::ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "{name} must not embed credentials"
+    );
+    anyhow::ensure!(
+        url.query().is_none() && url.fragment().is_none(),
+        "{name} must not contain a query or fragment"
+    );
+    anyhow::ensure!(url.port() != Some(0), "{name} must not use port 0");
+    let scheme = url.scheme();
+    let secure = scheme == secure_scheme;
+    let plain = plain_scheme.is_some_and(|plain| scheme == plain);
+    let loopback = url.host_str().is_some_and(|host| {
+        let host = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    });
+    anyhow::ensure!(
+        secure || (plain && loopback),
+        "{name} must use {secure_scheme}{}",
+        plain_scheme.map_or_else(String::new, |plain| format!(
+            " (or {plain} only for a loopback host)"
+        ))
+    );
+    Ok(url)
+}
+
+/// Validate that the capture and every sidecar resolve to distinct files.
+///
+/// A string comparison is insufficient: `./capture.sbe`, `capture.sbe`, and an
+/// absolute path can all name the same file. Existing paths are canonicalised
+/// (resolving symlinks), nonexistent paths are made absolute lexically, and
+/// existing hard links are compared by device/inode where the platform exposes
+/// them. This prevents a sidecar write from truncating the capture after a run.
+fn validate_output_paths(settings: &Settings) -> anyhow::Result<()> {
+    let mut paths: Vec<(&'static str, PathBuf)> = Vec::new();
+    if settings.output.path != "-" {
+        let output = PathBuf::from(&settings.output.path);
+        ensure_not_directory("output.path", &output)?;
+        paths.push(("output.path", output));
+    }
+    for (name, path) in [
+        ("metadata_path", settings.output.metadata_path.as_deref()),
+        ("report_path", settings.output.report_path.as_deref()),
+    ] {
+        let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) else {
+            continue;
+        };
+        anyhow::ensure!(
+            path.as_os_str() != "-",
+            "{name} must be a file path, not stdout"
+        );
+        ensure_not_directory(name, path)?;
+        paths.push((name, path.to_path_buf()));
+    }
+    for left in 0..paths.len() {
+        for right in left + 1..paths.len() {
+            let (left_name, left_path) = &paths[left];
+            let (right_name, right_path) = &paths[right];
+            if paths_alias(left_path, right_path)? {
+                bail!("{left_name} and {right_name} refer to the same file");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_not_directory(name: &str, path: &Path) -> anyhow::Result<()> {
+    if let Ok(metadata) = std::fs::metadata(path) {
+        anyhow::ensure!(
+            !metadata.is_dir(),
+            "{name} points to a directory: `{}`",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn paths_alias(left: &Path, right: &Path) -> anyhow::Result<bool> {
+    if left == right {
+        return Ok(true);
+    }
+    let left_normal = comparison_path(left)?;
+    let right_normal = comparison_path(right)?;
+    if left_normal == right_normal {
+        return Ok(true);
+    }
+    Ok(same_existing_file(left, right))
+}
+
+/// Canonical form for alias detection. Nonexistent files still compare
+/// correctly when their parent directory exists, including through symlinked
+/// directories.
+fn comparison_path(path: &Path) -> anyhow::Result<PathBuf> {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return Ok(canonical);
+    }
+    let absolute = std::path::absolute(path)
+        .with_context(|| format!("making `{}` absolute", path.display()))?;
+    let normalized = normalize_lexically(&absolute);
+    let Some(parent) = normalized.parent() else {
+        return Ok(normalized);
+    };
+    let Some(file_name) = normalized.file_name() else {
+        return Ok(normalized);
+    };
+    match std::fs::canonicalize(parent) {
+        Ok(parent) => Ok(parent.join(file_name)),
+        Err(_) => Ok(normalized),
+    }
+}
+
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+#[cfg(unix)]
+fn same_existing_file(left: &Path, right: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    match (std::fs::metadata(left), std::fs::metadata(right)) {
+        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_existing_file(_left: &Path, _right: &Path) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -449,5 +668,141 @@ mod tests {
 
         settings.output.report_path = Some(PathBuf::from("-"));
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn detects_lexical_output_path_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("capture.sbe");
+        let alias = directory.path().join(".").join("capture.sbe");
+        assert!(paths_alias(&output, &alias).unwrap());
+
+        let dotdot = directory.path().join("sub").join("..").join("capture.sbe");
+        assert!(paths_alias(&output, &dotdot).unwrap());
+
+        let mut settings = Settings::load(None).unwrap();
+        settings.output.path = output.to_string_lossy().into_owned();
+        settings.output.metadata_path = Some(alias);
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn detects_symlink_and_hardlink_output_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let output = real.join("capture.sbe");
+        #[cfg(unix)]
+        {
+            let link = directory.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert!(paths_alias(&output, &link.join("capture.sbe")).unwrap());
+
+            std::fs::write(&output, b"capture").unwrap();
+            let hardlink = directory.path().join("metadata.json");
+            std::fs::hard_link(&output, &hardlink).unwrap();
+            assert!(paths_alias(&output, &hardlink).unwrap());
+
+            let mut settings = Settings::load(None).unwrap();
+            settings.output.path = output.to_string_lossy().into_owned();
+            settings.output.metadata_path = Some(hardlink);
+            assert!(settings.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_directory_output_and_stdout_sidecars() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = Settings::load(None).unwrap();
+        settings.output.path = directory.path().to_string_lossy().into_owned();
+        assert!(settings.validate().is_err());
+
+        settings.output.path = "-".to_owned();
+        settings.output.metadata_path = Some(PathBuf::from("-"));
+        assert!(settings.validate().is_err());
+    }
+
+    fn settings_with_urls(gamma: &str, ws: &str) -> Settings {
+        let mut settings = Settings::load(None).unwrap();
+        settings.polymarket.gamma_url = gamma.to_owned();
+        settings.polymarket.ws_url = ws.to_owned();
+        settings
+    }
+
+    #[test]
+    fn validates_network_experiment_bounds() {
+        let mut settings = Settings::load(None).unwrap();
+        assert!(settings.validate().is_ok());
+        assert!(settings.network.tcp_nodelay);
+        assert_eq!(settings.network.connect_race, 1);
+
+        settings.network.connect_race = 0;
+        assert!(settings.validate().is_err());
+        settings.network.connect_race = 9;
+        assert!(settings.validate().is_err());
+
+        settings.network.connect_race = 2;
+        settings.network.source_port = Some(0);
+        assert!(settings.validate().is_err());
+        settings.network.source_port = Some(40_000);
+        assert!(settings.validate().is_err());
+        settings.network.source_port = None;
+        assert!(settings.validate().is_ok());
+
+        settings.network.source_ip = Some("127.0.0.1".parse().unwrap());
+        settings.network.source_port = Some(40_000);
+        settings.network.connect_race = 1;
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn validates_url_scheme_host_and_loopback_policy() {
+        assert!(
+            settings_with_urls(
+                "https://gamma-api.polymarket.com",
+                "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+            )
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            settings_with_urls("http://127.0.0.1:8080", "ws://[::1]:8080/ws")
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            settings_with_urls("http://localhost:8080", "ws://localhost:8080/ws")
+                .validate()
+                .is_ok()
+        );
+        for (gamma, ws) in [
+            ("file:///etc/passwd", "wss://example.com/ws"),
+            ("https://", "wss://example.com/ws"),
+            ("https://user:pass@example.com", "wss://example.com/ws"),
+            ("https://example.com?token=secret", "wss://example.com/ws"),
+            ("ftp://example.com", "wss://example.com/ws"),
+            ("http://example.com", "wss://example.com/ws"),
+            ("http://localhost.evil", "wss://example.com/ws"),
+            ("https://example.com:0", "wss://example.com/ws"),
+            ("https://gamma-api.polymarket.com", "ws://example.com/ws"),
+            (
+                "https://gamma-api.polymarket.com",
+                "wss://example.com/ws#fragment",
+            ),
+        ] {
+            assert!(
+                settings_with_urls(gamma, ws).validate().is_err(),
+                "expected rejection for {gamma} / {ws}"
+            );
+        }
+    }
+
+    #[test]
+    fn enforces_the_gamma_keyset_page_limit() {
+        let mut settings = Settings::load(None).unwrap();
+        settings.polymarket.discovery_page_size = 101;
+        assert!(settings.validate().is_err());
+        settings.polymarket.discovery_page_size = 100;
+        assert!(settings.validate().is_ok());
     }
 }

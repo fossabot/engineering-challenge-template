@@ -7,7 +7,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use engineering_challenge::{
-    config::Settings, coordinator, inspect, latency, replay, report::write_json_atomic,
+    config::Settings, coordinator, inspect, latency, replay, report::write_json_atomic, verify,
 };
 
 use crate::cli::{Cli, Command};
@@ -45,6 +45,22 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let summary = inspect::run(&input, &read_chunk_size, limit)?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
+            Ok(())
+        }
+        Command::Verify {
+            input,
+            read_chunk_size,
+        } => {
+            let summary = verify::run(&input, &read_chunk_size)?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+            anyhow::ensure!(
+                summary.valid,
+                "capture verification failed: {} unknown message(s), {} delta(s) before a \
+                 snapshot, {} snapshot mismatch(es)",
+                summary.unknown_messages,
+                summary.deltas_before_snapshot,
+                summary.snapshot_mismatches
+            );
             Ok(())
         }
         Command::Latency { out } => {

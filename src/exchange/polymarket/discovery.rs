@@ -13,6 +13,8 @@
 //! reconciliation for every valid market. A page whose records all fail
 //! conversion is treated as an untrustworthy response and fails the round.
 
+use std::collections::BTreeSet;
+
 use anyhow::{Context, bail};
 use serde::Deserialize;
 use serde_json::Value;
@@ -61,6 +63,19 @@ struct RawMarket {
     order_price_min_tick_size: Option<Value>,
 }
 
+/// One response from Gamma's keyset-paginated market endpoint.
+///
+/// `next_cursor` is documented as present only when the page is full. Treating
+/// its absence as exhaustion is therefore correct for both a short final page
+/// and an exact-multiple final page.
+#[derive(Debug, Clone, Deserialize)]
+struct KeysetPage {
+    #[serde(default)]
+    markets: Vec<RawMarket>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
+
 /// Outcome identifier flavour for one market record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IdentifierKind {
@@ -87,11 +102,17 @@ impl RawMarket {
     }
 
     fn into_markets(self, require_accepting_orders: bool) -> anyhow::Result<Vec<MarketInfo>> {
+        // `acceptingOrders` is nullable in the Gamma schema. When the strict
+        // policy is enabled, only an explicit `true` is accepted: a missing
+        // value is unconfirmed and must not be silently treated as tradable.
+        // Operators who need to include unknown records can disable the policy
+        // and rely on the active/closed/archived/order-book filters.
+        let accepting_orders_ok = !require_accepting_orders || self.accepting_orders == Some(true);
         if self.active == Some(false)
             || self.closed == Some(true)
             || self.archived == Some(true)
             || self.enable_order_book == Some(false)
-            || (require_accepting_orders && self.accepting_orders == Some(false))
+            || !accepting_orders_ok
         {
             return Ok(Vec::new());
         }
@@ -264,8 +285,12 @@ impl crate::exchange::polymarket::PolymarketExchange {
         max_markets: usize,
     ) -> anyhow::Result<Vec<MarketInfo>> {
         let base = self.settings().gamma_url.trim_end_matches('/').to_owned();
-        let page_size = self.settings().discovery_page_size.max(1);
-        let mut offset = 0usize;
+        // Gamma's keyset endpoint rejects more than 100 records per page with
+        // HTTP 422. The configuration validator enforces the same bound; the
+        // clamp keeps a directly constructed settings value safe.
+        let page_size = self.settings().discovery_page_size.clamp(1, 100);
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = BTreeSet::new();
         let mut markets = Vec::new();
         let mut pages = 0usize;
         let mut skipped = 0u64;
@@ -278,44 +303,55 @@ impl crate::exchange::polymarket::PolymarketExchange {
             if max_markets != 0 && markets.len() >= max_markets {
                 break;
             }
-            let mut url = Url::parse(&format!("{base}/markets"))
-                .context("building Polymarket Gamma markets URL")?;
+            let mut url = keyset_url(&base)?;
             {
                 let mut query = url.query_pairs_mut();
                 query
-                    .append_pair("active", "true")
                     .append_pair("closed", "false")
-                    .append_pair("limit", &page_size.to_string())
-                    .append_pair("offset", &offset.to_string());
+                    .append_pair("limit", &page_size.to_string());
+                if let Some(cursor) = &cursor {
+                    query.append_pair("after_cursor", cursor);
+                }
             }
             let page = self.fetch_page(&url).await?;
             pages = pages.saturating_add(1);
+            let received = page.markets.len();
+            let next_cursor = page.next_cursor.filter(|value| !value.is_empty());
             debug!(
                 page = pages,
-                count = page.len(),
-                offset,
+                count = received,
+                has_next_cursor = next_cursor.is_some(),
+                cursor = cursor.as_deref().unwrap_or(""),
                 "Polymarket discovery page"
             );
-            if page.is_empty() {
+            if received == 0 {
+                anyhow::ensure!(
+                    next_cursor.is_none(),
+                    "Polymarket discovery returned an empty page with a next_cursor"
+                );
                 break;
             }
-            let received = page.len();
             convert_page(
-                page,
+                page.markets,
                 self.settings().require_accepting_orders,
                 max_markets,
                 &mut markets,
                 &mut skipped,
             )
             .with_context(|| format!("converting Polymarket discovery page {pages}"))?;
-            // Gamma caps the returned page size below the requested `limit`
-            // (currently 100), so do not infer exhaustion from `received <
-            // page_size`. Continue until an empty page or the configured cap.
-            let next_offset = offset.saturating_add(received);
-            if next_offset == offset {
+            if max_markets != 0 && markets.len() >= max_markets {
                 break;
             }
-            offset = next_offset;
+            let Some(next_cursor) = next_cursor else {
+                break;
+            };
+            // A cursor is opaque, so the only safe cycle check is exact
+            // repetition. Refuse to loop rather than silently under-collecting.
+            anyhow::ensure!(
+                seen_cursors.insert(next_cursor.clone()),
+                "Polymarket discovery returned a repeated next_cursor"
+            );
+            cursor = Some(next_cursor);
             if self.settings().discovery_page_delay_ms > 0 {
                 sleep(std::time::Duration::from_millis(
                     self.settings().discovery_page_delay_ms,
@@ -354,7 +390,7 @@ impl crate::exchange::polymarket::PolymarketExchange {
         Ok(markets)
     }
 
-    async fn fetch_page(&self, url: &Url) -> anyhow::Result<Vec<RawMarket>> {
+    async fn fetch_page(&self, url: &Url) -> anyhow::Result<KeysetPage> {
         let mut last_error = None;
         for attempt in 0..5u32 {
             let request = self
@@ -364,6 +400,11 @@ impl crate::exchange::polymarket::PolymarketExchange {
             match request.send().await {
                 Ok(response) => {
                     let status = response.status();
+                    let retry_after = response
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.parse::<u64>().ok());
                     if status.is_success() {
                         let body = response
                             .text()
@@ -373,7 +414,9 @@ impl crate::exchange::polymarket::PolymarketExchange {
                             format!("decoding Polymarket discovery page from {url}")
                         });
                     }
-                    let retryable = status.as_u16() == 429 || status.is_server_error();
+                    let retryable = status.as_u16() == 429
+                        || status.as_u16() == 408
+                        || status.is_server_error();
                     let body = response.text().await.unwrap_or_default();
                     let message = format!(
                         "Polymarket discovery HTTP {}: {}",
@@ -384,6 +427,10 @@ impl crate::exchange::polymarket::PolymarketExchange {
                         bail!("{message}");
                     }
                     last_error = Some(message);
+                    if let Some(seconds) = retry_after {
+                        sleep(std::time::Duration::from_secs(seconds.min(30))).await;
+                        continue;
+                    }
                 }
                 Err(error) => {
                     last_error = Some(format!("Polymarket discovery request failed: {error}"));
@@ -399,8 +446,27 @@ impl crate::exchange::polymarket::PolymarketExchange {
     }
 }
 
+/// Build the keyset endpoint beneath a configured Gamma base URL.
+fn keyset_url(base: &str) -> anyhow::Result<Url> {
+    let mut url = Url::parse(base).context("building Polymarket Gamma keyset URL")?;
+    let path = format!("{}/markets/keyset", url.path().trim_end_matches('/'));
+    url.set_path(&path);
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::Mutex,
+    };
+
     use super::*;
 
     fn raw() -> RawMarket {
@@ -526,6 +592,17 @@ mod tests {
         market.accepting_orders = Some(false);
         assert!(market.clone().into_markets(true).unwrap().is_empty());
         assert_eq!(market.into_markets(false).unwrap().len(), 2);
+
+        // Missing is not implicitly true under the strict policy.
+        let mut market = raw();
+        market.accepting_orders = None;
+        assert!(market.clone().into_markets(true).unwrap().is_empty());
+        assert_eq!(market.into_markets(false).unwrap().len(), 2);
+
+        // Explicit true remains included.
+        let mut market = raw();
+        market.accepting_orders = Some(true);
+        assert_eq!(market.into_markets(true).unwrap().len(), 2);
     }
 
     #[test]
@@ -600,5 +677,159 @@ mod tests {
         );
         assert!(markets.is_empty());
         assert_eq!(skipped, 2);
+    }
+
+    #[test]
+    fn keyset_url_preserves_a_configured_path_prefix() {
+        assert_eq!(
+            keyset_url("https://gamma.example").unwrap().as_str(),
+            "https://gamma.example/markets/keyset"
+        );
+        assert_eq!(
+            keyset_url("https://gamma.example/api/").unwrap().as_str(),
+            "https://gamma.example/api/markets/keyset"
+        );
+    }
+
+    #[test]
+    fn keyset_response_accepts_an_absent_cursor() {
+        let page: KeysetPage = serde_json::from_value(json!({
+            "markets": [],
+        }))
+        .unwrap();
+        assert!(page.markets.is_empty());
+        assert!(page.next_cursor.is_none());
+    }
+
+    fn one_outcome_market(condition: &str, token: &str) -> Value {
+        json!({
+            "conditionId": condition,
+            "question": "Will the keyset test pass?",
+            "active": true,
+            "closed": false,
+            "archived": false,
+            "enableOrderBook": true,
+            "acceptingOrders": true,
+            "version": "v1",
+            "clobTokenIds": format!(r#"["{token}"]"#),
+            "outcomes": r#"["Yes"]"#,
+            "orderPriceMinTickSize": "0.01",
+        })
+    }
+
+    async fn serve_pages(pages: Vec<Value>) -> (std::net::SocketAddr, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        tokio::spawn(async move {
+            for page in pages {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = vec![0u8; 16 * 1024];
+                let Ok(read) = socket.read(&mut buffer).await else {
+                    return;
+                };
+                recorded
+                    .lock()
+                    .await
+                    .push(String::from_utf8_lossy(&buffer[..read]).into_owned());
+                let body = page.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: application/json\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\
+                     \r\n{}",
+                    body.len(),
+                    body
+                );
+                if socket.write_all(response.as_bytes()).await.is_err() {
+                    return;
+                }
+                let _ = socket.shutdown().await;
+            }
+        });
+        (address, requests)
+    }
+
+    fn exchange_for(
+        address: std::net::SocketAddr,
+    ) -> crate::exchange::polymarket::PolymarketExchange {
+        let settings = crate::config::PolymarketSettings {
+            gamma_url: format!("http://{address}"),
+            discovery_page_size: 2,
+            discovery_page_delay_ms: 0,
+            ..crate::config::PolymarketSettings::default()
+        };
+        crate::exchange::polymarket::PolymarketExchange::new(
+            settings,
+            crate::config::NetworkSettings::default(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn follows_keyset_cursors_without_using_offset() {
+        let (address, requests) = serve_pages(vec![
+            json!({
+                "markets": [
+                    one_outcome_market("0xaaa", "111"),
+                    one_outcome_market("0xbbb", "222"),
+                ],
+                "next_cursor": "cursor-one",
+            }),
+            json!({
+                "markets": [one_outcome_market("0xccc", "333")],
+            }),
+        ])
+        .await;
+        let exchange = exchange_for(address);
+        let markets =
+            tokio::time::timeout(std::time::Duration::from_secs(5), exchange.fetch_markets(0))
+                .await
+                .expect("keyset pagination timed out")
+                .unwrap();
+        assert_eq!(
+            markets
+                .iter()
+                .map(|market| market.native_symbol.as_str())
+                .collect::<Vec<_>>(),
+            ["111", "222", "333"]
+        );
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("GET /markets/keyset?"));
+        assert!(requests[0].contains("closed=false"));
+        assert!(requests[0].contains("limit=2"));
+        assert!(!requests[0].contains("offset="));
+        assert!(requests[1].contains("after_cursor=cursor-one"));
+        assert!(!requests[1].contains("offset="));
+    }
+
+    #[tokio::test]
+    async fn rejects_a_repeated_keyset_cursor() {
+        let (address, _requests) = serve_pages(vec![
+            json!({
+                "markets": [one_outcome_market("0xaaa", "111")],
+                "next_cursor": "loop",
+            }),
+            json!({
+                "markets": [one_outcome_market("0xbbb", "222")],
+                "next_cursor": "loop",
+            }),
+        ])
+        .await;
+        let exchange = exchange_for(address);
+        let error =
+            tokio::time::timeout(std::time::Duration::from_secs(5), exchange.fetch_markets(0))
+                .await
+                .expect("keyset cycle test timed out")
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("repeated next_cursor"),
+            "unexpected error: {error:#}"
+        );
     }
 }

@@ -12,7 +12,10 @@ use reqwest::Client;
 pub use session::{PolymarketExchange, PolymarketSessionFactory};
 
 use crate::{
-    config::PolymarketSettings, exchange::Exchange, model::MarketInfo, session::SessionFactory,
+    config::{NetworkSettings, PolymarketSettings},
+    exchange::Exchange,
+    model::MarketInfo,
+    session::SessionFactory,
 };
 
 #[async_trait]
@@ -35,7 +38,7 @@ impl Exchange for PolymarketExchange {
 }
 
 impl PolymarketExchange {
-    pub fn new(settings: PolymarketSettings) -> anyhow::Result<Self> {
+    pub fn new(settings: PolymarketSettings, network: NetworkSettings) -> anyhow::Result<Self> {
         let client = Client::builder()
             .user_agent(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
@@ -45,7 +48,11 @@ impl PolymarketExchange {
             .timeout(Duration::from_secs(settings.request_timeout_secs))
             .build()
             .map_err(|error| anyhow::anyhow!("building Polymarket HTTP client: {error}"))?;
-        Ok(Self { settings, client })
+        Ok(Self {
+            settings,
+            client,
+            network,
+        })
     }
 
     #[must_use]

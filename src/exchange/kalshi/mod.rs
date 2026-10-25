@@ -14,7 +14,10 @@ pub use auth::KalshiAuth;
 pub use session::{KalshiExchange, KalshiSessionFactory};
 
 use crate::{
-    config::KalshiSettings, exchange::Exchange, model::MarketInfo, session::SessionFactory,
+    config::{KalshiSettings, NetworkSettings},
+    exchange::Exchange,
+    model::MarketInfo,
+    session::SessionFactory,
 };
 
 #[async_trait]
@@ -42,7 +45,11 @@ impl Exchange for KalshiExchange {
 impl KalshiExchange {
     /// Construct the adapter. `require_auth` is false for public discovery and
     /// true for live collection.
-    pub fn new(settings: KalshiSettings, require_auth: bool) -> anyhow::Result<Self> {
+    pub fn new(
+        settings: KalshiSettings,
+        network: NetworkSettings,
+        require_auth: bool,
+    ) -> anyhow::Result<Self> {
         let auth = match KalshiAuth::from_settings(&settings) {
             Ok(auth) => Some(Arc::new(auth)),
             Err(error) if require_auth => return Err(error),
@@ -61,6 +68,7 @@ impl KalshiExchange {
             settings,
             auth,
             client,
+            network,
         })
     }
 

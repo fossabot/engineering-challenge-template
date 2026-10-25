@@ -2,7 +2,7 @@
 //! messages written by the
 //! [`AlignedSbeWriter`](crate::util::aligned_sbe_writer::AlignedSbeWriter).
 
-use std::{fs::File, marker::PhantomData, os::unix::fs::FileExt, path::Path};
+use std::{fs::File, io, marker::PhantomData, os::unix::fs::FileExt, path::Path};
 
 use anyhow::Context;
 use crossbeam::channel::{Receiver, Sender, bounded};
@@ -78,13 +78,13 @@ impl<T: AlignedSbeSchema> AlignedSbeReader<T> {
     /// Detect the power-of-two chunk size used by an aligned writer and open
     /// the file with that alignment.
     ///
-    /// Detection reads the file once and validates every chunk boundary against
-    /// the SBE schema. Captures produced by this project are always flushed to
-    /// whole chunks, so the file length is an exact multiple of the chunk size.
+    /// Detection validates every candidate boundary by streaming the file; it
+    /// never loads the whole capture into memory. The largest candidate is
+    /// [`MAX_AUTO_CHUNK_SIZE`]; a capture written with a larger chunk must be
+    /// opened with an explicit `--read-chunk-size`.
     pub fn open_auto(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
-        let bytes = std::fs::read(path)?;
-        let chunk_size = detect_chunk_size::<T>(&bytes)?;
+        let chunk_size = detect_chunk_size_file::<T>(path)?;
         Self::open_with_chunk_size(path, chunk_size)
     }
 
@@ -162,7 +162,7 @@ impl<T: AlignedSbeSchema> AlignedSbeReader<T> {
                 };
                 // Recycle short buffers produced by an earlier partial tail.
                 buffer.resize(take, 0);
-                if let Err(error) = file.read_exact_at(&mut buffer, file_offset) {
+                if let Err(error) = ChunkSource::read_exact_at(&file, file_offset, &mut buffer) {
                     let _ = ready_chunks_tx.send(Err(error));
                     return;
                 }
@@ -218,10 +218,11 @@ impl<T: AlignedSbeSchema> AlignedSbeReader<T> {
         let take =
             usize::try_from(remaining.min(self.chunk_size as u64)).expect("chunk size fits usize");
         self.buffer.resize(take, 0);
-        self.file
-            .as_ref()
-            .context("file moved to prefetch task")?
-            .read_exact_at(&mut self.buffer, self.file_offset)?;
+        ChunkSource::read_exact_at(
+            self.file.as_ref().context("file moved to prefetch task")?,
+            self.file_offset,
+            &mut self.buffer,
+        )?;
 
         self.file_offset += take as u64;
         self.buffer_pos = 0;
@@ -294,24 +295,68 @@ impl<T: AlignedSbeSchema> AlignedSbeReader<T> {
     }
 }
 
+/// Largest chunk size considered by [`AlignedSbeReader::open_auto`].
+///
+/// Detection streams one candidate chunk at a time, so this bound is also the
+/// peak memory used by detection. The default writer chunk is 64 MiB; captures
+/// written with a larger chunk remain readable with an explicit
+/// `--read-chunk-size`.
+pub const MAX_AUTO_CHUNK_SIZE: usize = 256 << 20;
+
+/// Read-only byte source used by bounded-memory chunk detection.
+trait ChunkSource {
+    fn len(&self) -> io::Result<u64>;
+    fn read_exact_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<()>;
+}
+
+impl ChunkSource for File {
+    fn len(&self) -> io::Result<u64> {
+        self.metadata().map(|metadata| metadata.len())
+    }
+
+    fn read_exact_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
+        FileExt::read_exact_at(self, buffer, offset)
+    }
+}
+
 /// Scan power-of-two chunk sizes and return the one whose complete chunks are
 /// valid SBE streams with a valid (possibly partial) final chunk.
-pub fn detect_chunk_size<T: AlignedSbeSchema>(bytes: &[u8]) -> anyhow::Result<usize> {
-    if bytes.is_empty() {
+fn detect_chunk_size_file<T: AlignedSbeSchema>(path: &Path) -> anyhow::Result<usize> {
+    let file = File::open(path)
+        .with_context(|| format!("opening `{}` for chunk detection", path.display()))?;
+    detect_chunk_size_source::<T, _>(&file)
+}
+
+fn detect_chunk_size_source<T: AlignedSbeSchema, S: ChunkSource>(
+    source: &S,
+) -> anyhow::Result<usize> {
+    let len = source.len().context("reading SBE source length")?;
+    if len == 0 {
         return Ok(DEFAULT_CHUNK_SIZE);
     }
 
+    let len_usize = usize::try_from(len).unwrap_or(usize::MAX);
+    // Include one candidate at or above the file length so a capture whose
+    // final chunk has not been padded yet is still decodable. The cap keeps
+    // detection memory bounded even for multi-gigabyte captures.
+    let limit = len_usize
+        .checked_next_power_of_two()
+        .unwrap_or(usize::MAX)
+        .clamp(1024, MAX_AUTO_CHUNK_SIZE);
     let mut best: Option<(usize, usize)> = None; // (chunk size, message count)
     let mut chunk = 1024usize;
-    // Include one candidate at or above the file length so a capture whose
-    // final chunk has not been padded yet is still decodable.
-    let limit = bytes.len().next_power_of_two().max(1024);
+    let mut buffer = Vec::new();
     while chunk <= limit {
-        match validate_aligned::<T>(bytes, chunk) {
+        match validate_aligned_source::<T, _>(source, chunk, &mut buffer) {
             Ok(count) if count > 0 && best.is_none_or(|(_, best_count)| count > best_count) => {
                 best = Some((chunk, count));
             }
             _ => {}
+        }
+        // Every candidate at or above the file length parses the file as one
+        // partial chunk, so trying a larger one cannot add information.
+        if u64::try_from(chunk).unwrap_or(u64::MAX) >= len {
+            break;
         }
         chunk = chunk.saturating_mul(2);
     }
@@ -321,31 +366,42 @@ pub fn detect_chunk_size<T: AlignedSbeSchema>(bytes: &[u8]) -> anyhow::Result<us
     }
 
     anyhow::bail!(
-        "could not auto-detect chunk size for {} bytes of SBE data; \
-         specify --chunk-size explicitly",
-        bytes.len()
+        "could not auto-detect chunk size for {} bytes of SBE data within {} MiB; \
+         specify --read-chunk-size explicitly",
+        len,
+        MAX_AUTO_CHUNK_SIZE >> 20
     )
 }
 
-fn validate_aligned<T: AlignedSbeSchema>(bytes: &[u8], chunk: usize) -> anyhow::Result<usize> {
+fn validate_aligned_source<T: AlignedSbeSchema, S: ChunkSource>(
+    source: &S,
+    chunk: usize,
+    buffer: &mut Vec<u8>,
+) -> anyhow::Result<usize> {
+    let len = source.len().context("reading SBE source length")?;
     let mut total = 0usize;
-    for start in (0..bytes.len()).step_by(chunk) {
-        let end = (start + chunk).min(bytes.len());
+    let mut start = 0u64;
+    while start < len {
+        let take = usize::try_from((len - start).min(chunk as u64))
+            .expect("chunk size fits usize after the detection cap");
+        buffer.resize(take, 0);
+        source
+            .read_exact_at(start, buffer)
+            .context("reading aligned SBE chunk")?;
         let mut pos = 0usize;
-        while start + pos < end {
-            let offset = start + pos;
-            let remaining = end - offset;
+        while pos < take {
+            let remaining = take - pos;
             if remaining < HEADER_LENGTH {
                 // Fewer than a header: a partial tail, not an error.
                 break;
             }
-            let header = &bytes[offset..offset + HEADER_LENGTH];
+            let header = &buffer[pos..pos + HEADER_LENGTH];
             if header == [0; HEADER_LENGTH] {
                 // A sentinel must be followed only by zero padding through the
                 // end of this chunk. In a partial final chunk the sentinel is
                 // the last data byte.
                 anyhow::ensure!(
-                    bytes[offset..end].iter().all(|byte| *byte == 0),
+                    buffer[pos..].iter().all(|byte| *byte == 0),
                     "non-zero bytes after the chunk sentinel"
                 );
                 break;
@@ -360,7 +416,7 @@ fn validate_aligned<T: AlignedSbeSchema>(bytes: &[u8], chunk: usize) -> anyhow::
             );
 
             let (message_len, expected_block_length) = {
-                let decoded = T::try_decode(bytes, offset)?;
+                let decoded = T::try_decode(buffer, pos)?;
                 (
                     T::encoded_length(&decoded)?,
                     T::expected_block_length(&decoded)?,
@@ -375,6 +431,7 @@ fn validate_aligned<T: AlignedSbeSchema>(bytes: &[u8], chunk: usize) -> anyhow::
             pos += message_len;
             total += 1;
         }
+        start += u64::try_from(take).expect("chunk length fits u64");
     }
     Ok(total)
 }

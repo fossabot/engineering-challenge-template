@@ -13,6 +13,7 @@ pub mod report;
 pub mod session;
 pub mod time;
 pub mod util;
+pub mod verify;
 pub mod writer;
 pub mod ws;
 

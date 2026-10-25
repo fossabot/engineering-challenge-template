@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use tracing::warn;
 
 use crate::{
-    config::KalshiSettings,
+    config::{KalshiSettings, NetworkSettings},
     exchange::kalshi::{
         KalshiAuth,
         auth::{HEADER_KEY, HEADER_SIGNATURE, HEADER_TIMESTAMP},
@@ -23,7 +23,7 @@ use crate::{
     model::SourceId,
     session::{MarketDataSession, SessionFactory, SessionFailure, SessionFrame},
     time::now_us,
-    ws::{self, WsPayload, WsStream},
+    ws::{self, ConnectOptions, WsPayload, WsStream},
 };
 
 /// Maximum consecutive classification-driven recoveries before the session
@@ -146,6 +146,7 @@ pub struct KalshiExchange {
     pub(crate) settings: KalshiSettings,
     pub(crate) auth: Option<Arc<KalshiAuth>>,
     pub(crate) client: Client,
+    pub(crate) network: NetworkSettings,
 }
 
 pub type KalshiSessionFactory = KalshiExchange;
@@ -158,9 +159,15 @@ impl SessionFactory for KalshiExchange {
                 "Kalshi credentials are required for source {source}; provide key_id and a private key"
             )
         })?;
+        let connect_options = self
+            .network
+            .connect_options()
+            .for_ordinal(source_ordinal(source))
+            .with_context(|| format!("deriving connect options for source {source}"))?;
         Ok(Box::new(KalshiSession::new(
             self.settings.clone(),
             Arc::clone(auth),
+            connect_options,
         )))
     }
 }
@@ -168,6 +175,15 @@ impl SessionFactory for KalshiExchange {
 struct OrderbookSubscription {
     sid: i64,
     markets: BTreeSet<String>,
+}
+
+/// Unique per-connection ordinal used to derive distinct pinned source ports.
+///
+/// The replica bound is validated to at most four, and shards to at most 256,
+/// so `shard * 256 + replica` is injective across all live connections of a
+/// run.
+fn source_ordinal(source: SourceId) -> u32 {
+    u32::from(source.shard) * 256 + u32::from(source.replica)
 }
 
 pub struct KalshiSession {
@@ -189,10 +205,15 @@ pub struct KalshiSession {
     rate_limit_backoff: Duration,
     transient_recoveries: u32,
     ws_url: String,
+    connect_options: ConnectOptions,
 }
 
 impl KalshiSession {
-    fn new(settings: KalshiSettings, auth: Arc<KalshiAuth>) -> Self {
+    fn new(
+        settings: KalshiSettings,
+        auth: Arc<KalshiAuth>,
+        connect_options: ConnectOptions,
+    ) -> Self {
         let batch_size = settings.batch_size.max(1);
         let ws_url = settings.environment.ws_url().to_owned();
         Self {
@@ -212,6 +233,7 @@ impl KalshiSession {
             rate_limit_backoff: RATE_LIMIT_BACKOFF_START,
             transient_recoveries: 0,
             ws_url,
+            connect_options,
         }
     }
 
@@ -427,7 +449,7 @@ impl MarketDataSession for KalshiSession {
             (HEADER_SIGNATURE, headers.signature),
             (HEADER_TIMESTAMP, headers.timestamp),
         ];
-        let stream = ws::connect(&self.ws_url, &handshake_headers)
+        let stream = ws::connect(&self.ws_url, &handshake_headers, &self.connect_options)
             .await
             .map_err(|error| {
                 if matches!(ws::http_status(&error), Some(401 | 403)) {
@@ -792,7 +814,7 @@ mod tests {
             batch_size: 100,
             ..KalshiSettings::default()
         };
-        let mut session = KalshiSession::new(settings, test_auth());
+        let mut session = KalshiSession::new(settings, test_auth(), ConnectOptions::default());
         session.ws_url = format!("ws://{address}");
         session.connect().await.unwrap();
         session
@@ -1061,7 +1083,7 @@ mod tests {
             batch_size: 4,
             ..KalshiSettings::default()
         };
-        let mut session = KalshiSession::new(settings, test_auth());
+        let mut session = KalshiSession::new(settings, test_auth(), ConnectOptions::default());
         session.ws_url = format!("ws://{address}");
         session.connect().await.unwrap();
         session

@@ -42,10 +42,12 @@ pub fn build_exchange(
     match settings.exchange {
         ExchangeKind::Kalshi => Ok(Arc::new(KalshiExchange::new(
             settings.kalshi.clone(),
+            settings.network.clone(),
             require_auth,
         )?)),
         ExchangeKind::Polymarket => Ok(Arc::new(PolymarketExchange::new(
             settings.polymarket.clone(),
+            settings.network.clone(),
         )?)),
     }
 }
