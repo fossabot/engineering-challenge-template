@@ -108,12 +108,13 @@ latency benchmark.
 
 ## CI status
 
-The local commands above are the CI-equivalent gates defined in
-`.github/workflows/ci.yml`. The GitHub Actions workflow has **not** produced a
-successful run from this environment: the latest inspected run failed before
-any step executed, consistent with the account billing lock. This submission
-does not claim green CI. The live public-feed workflow is manual
-(`workflow_dispatch`) and was not triggered as part of this gate.
+The commands above are the gates defined in `.github/workflows/ci.yml`. The
+workflow runs on every push; run
+[40166110564](https://github.com/kj111422/engineering-challenge-template/actions/runs/40166110564)
+passed all steps on `ubuntu-latest`: format check, clippy with `-D warnings`,
+`cargo test --all-targets --locked`, documentation tests, and the release
+build. The live public-feed workflow is manual (`workflow_dispatch`) and was
+not triggered as part of this gate.
 
 ## Count reconciliation
 

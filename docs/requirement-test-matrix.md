@@ -57,6 +57,3 @@ The final gate run and its exact counts are recorded in
 - **Extension 4 causality.** The four latency files are single 60-second
   observations. Source-port/CDN hashing and Nagle/delayed-ACK explanations are
   hypotheses, not isolated mechanisms.
-- **Green GitHub Actions.** The account's billing lock prevented the workflow
-  from executing. The local CI-equivalent gates pass; that is not a green CI
-  claim.

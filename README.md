@@ -63,9 +63,9 @@ writer, and SBE reader. The public Polymarket network test is opt-in:
 RUN_LIVE_TESTS=1 cargo test --test live_polymarket -- --ignored --nocapture
 ```
 
-The GitHub Actions workflow runs the same gates, but no successful run has
-executed from this environment because the account is billing-locked. The local
-gates pass; this repository does **not** claim green CI.
+The GitHub Actions workflow runs the same gates on every push; run
+[40166110564](https://github.com/kj111422/engineering-challenge-template/actions/runs/40166110564)
+passed all steps on `ubuntu-latest`.
 
 ## Quick start: Kalshi
 
