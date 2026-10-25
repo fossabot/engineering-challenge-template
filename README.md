@@ -8,6 +8,11 @@ Kalshi is the primary exchange adapter. Polymarket's public CLOB market channel
 is included as a working fallback and as a public, credential-free way to
 validate the transport, sharding, snapshot, replay, and inspection paths.
 
+See the [requirement-to-test matrix](docs/requirement-test-matrix.md) for the
+challenge-to-evidence map, and
+[final verification](docs/final-verification-2026-10-25.md) for the exact
+offline gate results.
+
 ## What it does
 
 - Discovers live, non-MVE Kalshi markets and subscribes to every selected ticker.
@@ -44,14 +49,25 @@ cargo test --doc --locked
 cargo build --release --locked
 ```
 
-The offline test suite covers decoding, fixed-point arithmetic, order books,
+The final local CI-equivalent run has **127 passing offline tests**: 118
+library tests, 7 mock-exchange end-to-end tests, and 2 replay integration tests.
+The public Polymarket network test is separate and ignored by default. Exact
+commands, counts, and the CI status are recorded in
+[`docs/final-verification-2026-10-25.md`](docs/final-verification-2026-10-25.md).
+
+The offline suite covers decoding, fixed-point arithmetic, order books,
 sharding/failover/snapshot scheduling, maintenance clock resets, malformed
-discovery rejection, SBE sentinel validation, and an end-to-end replay fixture.
-The public Polymarket network test is opt-in and ignored by default:
+discovery rejection, SBE sentinel validation, an end-to-end replay fixture, and
+a loopback mock exchange that drives the real coordinator, adapters, sessions,
+writer, and SBE reader. The public Polymarket network test is opt-in:
 
 ```bash
 RUN_LIVE_TESTS=1 cargo test --test live_polymarket -- --ignored --nocapture
 ```
+
+The GitHub Actions workflow runs the same gates, but no successful run has
+executed from this environment because the account is billing-locked. The local
+gates pass; this repository does **not** claim green CI.
 
 ## Quick start: Kalshi
 
@@ -236,6 +252,38 @@ immediately after a websocket frame is read and before decoding. The
 `sending_ts_ms` / `ts_ms`, or Polymarket `timestamp`. When no exchange timestamp
 exists, the local receive time is used.
 
+### Ordering and timestamp contract
+
+- Receive timestamps are captured once per frame and serialized unchanged. The
+  writer does not clamp or rewrite them.
+- File order is the single writer's processing order across all sources. It is
+  **not** globally sorted by timestamp. A frame from one source can be processed
+  after a later-timestamped frame from another source, so cross-symbol receive
+  timestamps may regress.
+- Per symbol, the first full snapshot anchors the book; later deltas apply to
+  the most recent snapshot in file order. Failover, recovery, removal, periodic,
+  and final snapshots are emitted before any resumed deltas.
+- Generated snapshots are timestamped from the triggering status or processing
+  time. A failover snapshot uses the lost source's last-frame time (or the
+  current clock when none exists). Because status and data events arrive on
+  different worker channels, that generated timestamp can be a few microseconds
+  older than the last delta written before it. It is still the actual evidence
+  time, not a rewritten event timestamp.
+- Durations, retries, and timeouts use monotonic time: session backoff and
+  timeouts use `Instant`/Tokio timers, and the live collector's snapshot/probe
+  tick uses `MonotonicClock` anchored at startup. Event receive timestamps use
+  the wall clock. Replay uses fixture timestamps so the core remains
+  deterministic.
+- No bounded reordering buffer is implemented. Global chronological output is
+  not a contract; a consumer that needs a sorted stream must buffer downstream
+  with an explicit delay.
+
+Deterministic tests:
+`collector::state::tests::snapshot_anchors_delta_application_in_per_symbol_order`,
+`collector::state::tests::failover_snapshot_anchors_resumed_deltas_and_preserves_receive_times`,
+`collector::state::tests::cross_symbol_output_order_is_processing_order_and_not_globally_sorted`,
+and the E2E per-symbol anchor helpers.
+
 ## Output
 
 The output file is an aligned SBE stream with 64 MiB chunks by default, the
@@ -290,7 +338,45 @@ so the command exits non-zero and reports the offending symbols with samples.
 `unknown_messages` (the schema allows template ids this collector never emits)
 and deltas that arrive before their symbol's first snapshot also fail
 verification; the check is deliberately strict because a silently inconsistent
-backtest is worse than a failed capture.
+backtest is worse than a failed capture. An empty snapshot is treated as a
+retirement/empty-book boundary rather than a mismatch: it carries no level
+evidence, so it cannot prove that a suppressed update was observed. Only a
+later non-empty snapshot can expose a gap.
+
+### Capture completeness and the mock exchange
+
+`tests/e2e_mock_exchange.rs` is an independent oracle test, not another unit
+test of the core. It starts loopback Gamma keyset and Polymarket WebSocket
+servers, drives `coordinator::run_with_shutdown`, and reads the resulting SBE
+file through the same reader used by `inspect`/`verify`. The mock exchange owns
+the authoritative book and a full delivered-update history. The seven scenarios
+are:
+
+1. steady state: every delivered update and resulting book matches the mock
+   history, not only the final book;
+2. one socket loss: the failover snapshot anchors the shadow book and resumed
+   deltas apply to it;
+3. full outage: updates during the uncovered interval are absent and `verify`
+   reports the mismatch instead of claiming completeness;
+4. discovery churn: a removed symbol ends with an empty retirement snapshot and
+   a new symbol starts with its own snapshot;
+5. silent subscription: suppressed updates trigger a stale probe,
+   reconnect/resubscribe, and a repair snapshot;
+6. negative control: a missing update is detected when a later non-empty
+   snapshot exposes it;
+7. subscription scale: 1,000 symbols, 4 shards, 2 replicas, 8 WebSockets, 250
+   symbols per socket, and 2,000 subscription entries.
+
+The mock exchange is the completeness oracle for these scenarios. `verify` is a
+capture self-consistency check, not a proof that no update was missed. The
+full-outage and negative-control tests deliberately assert that `verify` is
+invalid.
+
+The scale test is the tested operating envelope, not a live capacity claim. The
+548,942-token discovery sweep proves keyset discovery only; it does not prove
+simultaneous subscription or collection at that fan-out. Configured bounds are
+up to 256 shards, 4 replicas, `max_symbols_per_socket = 5,000`, and
+`max_shards = 64` for automatic sharding.
 
 ## Latency experiments (Extension 4)
 
@@ -345,16 +431,18 @@ window; the raw reports are checked in under `measurements/`:
 | Arrival skew p50 | 65 µs | 59 µs | 67,845 µs | 10,543 µs |
 | Arrival skew p95 | 27,004 µs | 5,496 µs | 74,093 µs | 15,280 µs |
 
-These are measurements, not benchmarks or guarantees. The cross-connection
-arrival skew is the clock-independent number: two sockets on this host usually
-saw the same update within tens of microseconds, racing four full handshakes
-selected a faster connection in these runs, source-port pinning was the *worst*
-configuration measured (the venue's CDN can hash the source port onto a worse
-origin path), and disabling `TCP_NODELAY` moved the skew p50 from 65 µs to
-10.5 ms. Timestamp latency (`local_receive_us - exchange_timestamp_us`)
-remains dominated by exchange/local clock offset and venue timestamp semantics.
-The methodology, all caveats, and the full findings are in
-[docs/latency.md](docs/latency.md).
+These are four single 60-second observations, not benchmarks, guarantees, or
+causal identification. The cross-connection arrival skew is the
+clock-independent number: two sockets on this host usually saw the same update
+within tens of microseconds, and racing four full handshakes selected a faster
+connection in these runs. Source-port pinning was the *worst* configuration in
+this sample; one hypothesis is that the venue's CDN hashes the source port onto
+a worse origin path, but that mechanism was not isolated. Disabling
+`TCP_NODELAY` correlated with a skew p50 of 10.5 ms instead of 65 µs; a
+Nagle/delayed-ACK interaction is a hypothesis, not a proven cause. Timestamp
+latency (`local_receive_us - exchange_timestamp_us`) remains dominated by
+exchange/local clock offset and venue timestamp semantics. The methodology, all
+caveats, and the full findings are in [docs/latency.md](docs/latency.md).
 
 A 20-second public smoke capture with 4 symbols and 2 replicas produced 58 SBE
 messages (8 snapshots and 50 deltas), with zero writer errors and zero rejected
@@ -409,10 +497,13 @@ src/
   verify.rs           capture self-consistency verification
   latency.rs          measured latency, connection setup, and cross-replica skew
   report.rs           atomic run-report and metadata sidecars
+  time.rs             wall-clock timestamps and the monotonic scheduling clock
   ws.rs               websocket transport: TCP_NODELAY, source binding, racing
   util/               supplied aligned SBE helpers and generated DTOs
 fixtures/             deterministic replay fixture
-docs/                 replay format and latency methodology
+tests/                replay, opt-in live, and mock-exchange E2E tests
+docs/                 replay format, latency methodology, requirement matrix,
+                      and final verification evidence
 measurements/         exact measured reports from public runs
 ```
 
@@ -433,8 +524,19 @@ measurements/         exact measured reports from public runs
   `--read-chunk-size`. Auto-detection may select a smaller power-of-two chunk
   that also validates the file, so pass the writer's exact `--chunk-size` when
   the exact chunk size matters.
-- The latency tables are short public-feed observations, not controlled
-  benchmarks across networks or colocated hosts.
+- The latency tables are four short public-feed observations, not controlled
+  benchmarks across networks or colocated hosts. Source-port/CDN hashing and
+  Nagle/delayed-ACK explanations are hypotheses, not causal findings.
+- The 548,942-token full-universe sweep is a discovery result, not a
+  simultaneous-subscription result. The tested subscription envelope is 1,000
+  loopback symbols across 4 shards and 2 replicas; configured limits are not
+  measured live capacity.
+- Global chronological output is not a contract. File order is processing order
+  and preserves actual receive timestamps; timestamp sorting can reorder
+  cross-source events and is not equivalent to replaying the capture.
+- GitHub Actions has not run successfully from this environment because the
+  account is billing-locked. The local CI-equivalent gates pass; CI is not
+  claimed green.
 
 ## License
 

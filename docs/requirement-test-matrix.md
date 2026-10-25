@@ -1,0 +1,62 @@
+# Requirement-to-test matrix
+
+Test names are exact; the offline suite is run by `cargo test --all-targets --locked`.
+The public-network test is separate and ignored unless `RUN_LIVE_TESTS=1` is set.
+
+The final gate run and its exact counts are recorded in
+[`final-verification-2026-10-25.md`](final-verification-2026-10-25.md).
+
+## Mandatory requirements
+
+| ID | Requirement | Implementation | Offline / deterministic evidence | Live evidence and limits | Status |
+|---|---|---|---|---|---|
+| M1 | Connect to Kalshi for order-book data | `src/exchange/kalshi/{auth,discovery,codec,session}.rs`; environment selected by `KalshiEnvironment`, production by default | `exchange::kalshi::auth::tests::{ed25519_signatures_verify,rsa_pkcs8_and_pkcs1_signatures_verify,rejects_missing_or_invalid_keys}`, `exchange::kalshi::codec::tests::*`, `exchange::kalshi::session::tests::*` | No authenticated live handshake: credentials were not supplied. The adapter is implemented but live validation is **blocked**, not claimed. | Implemented, live blocked |
+| M2 | Subscribe to all live symbols; exclude MVEs | `src/exchange/kalshi/discovery.rs`, `src/exchange/polymarket/discovery.rs`, `src/collector/state.rs` (`apply_discovery`) | `exchange::kalshi::discovery::tests::{converts_active_non_mve_market,rejects_inactive_and_mve_markets,filtered_records_are_not_failures}`, `exchange::polymarket::discovery::tests::{version_policy,version_v2_uses_position_ids,rejects_closed_or_non_orderbook_markets,expands_outcome_tokens}` | Polymarket full-universe keyset discovery completed: 2,746 pages, 548,942 unique tokens, 9m52s. Simultaneous subscription at that fan-out was not tested. | Verified offline; Polymarket live discovery verified |
+| M3 | Maintain an order book for each symbol | `src/orderbook.rs`; source-local books in `src/collector/state.rs`; snapshots replace, deltas apply, zero removes, invalid states reject | `orderbook::tests::*`; `collector::state::tests::snapshot_anchors_delta_application_in_per_symbol_order`; E2E `steady_state_history_matches_mock_exchange_truth` | Short Polymarket live runs exercised snapshots and deltas; no long soak. | Verified offline and in short live runs |
+| M4 | Continuously add new symbols and unsubscribe symbols that are no longer trading | `apply_discovery` in `src/collector/state.rs`; periodic discovery in `src/coordinator.rs`; removal emits an empty snapshot | `collector::state::tests::{discovery_adds_and_removes_with_controls,removal_emits_empty_snapshot,rediscovery_with_changed_metadata_keeps_symbol_stable,identity_change_retires_old_symbol_and_reseeds_state}`; E2E `discovery_churn_retires_and_adds_symbols` | Live discovery reconciled repeatedly, but short runs did not observe a full market retirement. | Verified offline; live churn not forced |
+| M5 | Write order-book deltas to stdout and a full snapshot every minute | Writer defaults to `-` (binary stdout); `snapshot_interval_secs = 60`; periodic snapshots spread by symbol hash; failover/recovery/removal/final snapshots | `collector::state::tests::periodic_snapshot_is_spread_and_emitted`; `writer::tests::{flush_makes_output_visible_to_reader,default_chunk_output_is_readable_by_default_reader}`; E2E steady/full-outage scenarios | File and binary-stdout runs exercised; a redirected stdout capture decoded with the pristine template reader. | Verified offline and live |
+| M6 | Use the supplied helpers and standard SBE output | `src/util/aligned_sbe_{writer,reader}.rs`, generated DTOs, unchanged `sbe_schemas/` | `tests/replay_fixture.rs::sample_fixture_replays_through_the_same_core_and_decodes`; `util::aligned_sbe_writer::tests::*`; `writer::tests::default_chunk_output_is_readable_by_default_reader`; `inspect` on captures | A pristine template-reader worktree decoded a live capture 18/18 and a replay capture 11/11. | Verified offline and live |
+| M7 | On SIGINT, close websockets and the output file | Signal handling in `src/coordinator.rs`; worker shutdown broadcast/commands; final snapshots; writer flush/sync; report sidecar | `writer::tests::{normal_shutdown_drains_and_joins,shutdown_drains_saturated_queue_and_joins,finish_failure_on_shutdown_is_reported}`; E2E shutdown assertions (`report.shutdown_reason == "test scenario complete"`) | Live SIGINT run: reason `SIGINT`, final snapshots written, writer errors 0. | Verified offline and live |
+| M8 | Load-balance symbols across multiple websockets | Fixed shard assignment at startup; `replicas` sockets per shard; least-loaded shard for additions; `shards = 0` derives the count | `collector::state::tests::{discovery_adds_and_removes_with_controls,shadow_replica_takes_over_after_source_loss}`; E2E `mock_subscription_scale_across_shards` (1,000 symbols, 4 shards, 2 replicas, 8 sockets, 2,000 subscription entries) | Live 2-shard run: 6 symbols, 2 sources, 32 SBE messages, 0 errors. The loopback E2E scale is the tested envelope, not 548,942 simultaneous live subscriptions. | Verified offline and in a live multi-source run |
+| M9 | Data must be complete and time-accurate | Kalshi sequence tracking; targeted resubscribe/backoff; maintenance epochs; Polymarket reconnect/resubscribe; receive timestamps captured before decode; no timestamp clamp | E2E steady state compares every delivered update and its resulting book against the mock exchange's full history; E2E failover/outage/negative control cover recovery boundaries; `collector::state::tests::{snapshot_anchors_delta_application_in_per_symbol_order,failover_snapshot_anchors_resumed_deltas_and_preserves_receive_times,cross_symbol_output_order_is_processing_order_and_not_globally_sorted}`; `verify::tests::*` | Short public-feed observations and mock-exchange fault injection; no Kalshi live run, long soak, or exchange-wide fault injection. | Verified offline; live scope limited |
+
+## Optional extensions
+
+| ID | Extension | Implementation | Evidence | Status |
+|---|---|---|---|---|
+| E1 | Redundant websockets; emit a snapshot when switching sources | Per-shard replicas, shadow books, `best_backup`, failover/reseat snapshots | E2E `single_socket_loss_fails_over_and_emits_anchoring_snapshot`; `collector::state::tests::{shadow_replica_takes_over_after_source_loss,failover_snapshot_anchors_resumed_deltas_and_preserves_receive_times}`; `sequence_reset_fails_over_to_valid_shadow` | Implemented and offline-verified |
+| E2 | Subscription monitoring; resubscribe quiet symbols; periodic reconnect | Idle timeout, stale probes, snapshot requests/reconnect, periodic refresh with jitter | E2E `silent_subscription_is_detected_and_repaired` (takes about 12 s because the test sets `stale_probe_after_secs = 10`); `collector::state::tests::{shadow_snapshot_does_not_reset_active_probe_state,stale_shadow_snapshot_does_not_emit_after_source_loss}`; `exchange::kalshi::session::tests::*` | Implemented and offline-verified |
+| E3 | Generic encode/decode per exchange | `Exchange`, `MarketDataSession`, `SessionFactory`; Kalshi and Polymarket adapters behind the same core | Codec/discovery tests for both exchanges; replay fixture; E2E drives the real Polymarket adapter through the real coordinator | Implemented and offline-verified |
+| E4 | Latency experiments written in markdown | `src/latency.rs`, `src/ws.rs`, `docs/latency.md`; `TCP_NODELAY`, source binding, full-handshake racing, cross-connection skew | `latency::tests::*`, `ws::tests::{default_connect_options_disable_nagle_and_do_not_race,pinned_source_ports_are_derived_per_connection,ephemeral_ports_ignore_the_ordinal}`; four checked-in 60-second observations | Implemented; four single observations, not a benchmark or causal proof |
+
+## Cross-cutting evidence
+
+| Claim | Test / evidence | What it establishes, and what it does not |
+|---|---|---|
+| The capture contains every update the mock exchange delivered in steady state | E2E `steady_state_history_matches_mock_exchange_truth` | Compares captured delta count, side, price, quantity, per-update resulting book, and final book against the mock's independent history. It does not prove anything about the live exchange. |
+| A source switch is anchored by a full snapshot before resumed deltas | E2E `single_socket_loss_fails_over_and_emits_anchoring_snapshot`; `failover_snapshot_anchors_resumed_deltas_and_preserves_receive_times` | The snapshot equals the shadow's truth at loss and later deltas apply to it. It does not prove a live venue's shadow is complete. |
+| A full outage exposes an uncovered interval instead of silently claiming completeness | E2E `full_outage_recovery_exposes_the_uncovered_interval` | Updates during the outage are absent; `verify` reports the pre-outage deltas disagreeing with the recovery snapshot. |
+| Discovery churn retires and adds symbols without mixing their histories | E2E `discovery_churn_retires_and_adds_symbols` | The retired symbol ends with an empty snapshot; the new symbol starts with a snapshot and its own deltas; `verify` accepts the retirement boundary. |
+| A silent subscription is detected and repaired | E2E `silent_subscription_is_detected_and_repaired` | Suppressed updates trigger a stale probe, reconnect/resubscribe, and a recovery snapshot. It does not prove detection of every venue-specific silence pattern. |
+| A missed update is detectable when a later snapshot exposes it | E2E `negative_control_missing_update_is_detected_by_verify` | `verify` exits invalid when a later non-empty snapshot disagrees with the reconstructed book; `verify` is not a completeness oracle by itself. |
+| Timestamps are actual receive times and are not clamped | `snapshot_anchors_delta_application_in_per_symbol_order`; `failover_snapshot_anchors_resumed_deltas_and_preserves_receive_times`; E2E `assert_delta_receive_times_monotonic` | Event receive timestamps are preserved exactly. Generated failover snapshots use the triggering status/last-frame time and are not rewritten. |
+| Output order is processing order, not global timestamp order | `cross_symbol_output_order_is_processing_order_and_not_globally_sorted`; E2E `assert_per_symbol_anchor` | Per-symbol snapshots anchor subsequent deltas. Cross-symbol timestamps may regress; consumers must preserve file order. |
+| `verify` handles retirement/empty books without false mismatches | `verify::tests::empty_snapshot_is_a_retirement_boundary_not_a_mismatch` | An empty snapshot is counted as a boundary, not compared level-by-level. It cannot prove a suppressed update that emptied a book was observed; only a later non-empty snapshot can. |
+| Subscription scale is tested beyond discovery | E2E `mock_subscription_scale_across_shards` | 1,000 symbols, 4 shards, 2 replicas, 8 loopback WebSockets, 250 symbols per socket, 2,000 subscription entries. It does not establish live venue limits or 548,942 simultaneous subscriptions. |
+
+## Explicitly not claimed
+
+- **Kalshi live validation.** No authorized credentials were supplied. The
+  signing, codec, discovery, and mock-session tests are not a live handshake.
+- **Full-universe simultaneous subscription.** The 548,942-token sweep is a
+  discovery result. The tested subscription envelope is the 1,000-symbol
+  loopback E2E above; the configured limits are separate.
+- **Global chronological output.** The writer preserves processing order and
+  actual receive timestamps. There is no bounded reordering buffer, and no
+  claim that sorting by timestamp reconstructs the books.
+- **Extension 4 causality.** The four latency files are single 60-second
+  observations. Source-port/CDN hashing and Nagle/delayed-ACK explanations are
+  hypotheses, not isolated mechanisms.
+- **Green GitHub Actions.** The account's billing lock prevented the workflow
+  from executing. The local CI-equivalent gates pass; that is not a green CI
+  claim.

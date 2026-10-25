@@ -2,6 +2,12 @@
 
 ## What is measured
 
+> **Evidence level.** The four 2026-10-24 runs below are single 60-second
+> observations on one laptop and one network path. They are not a controlled
+> benchmark, a distribution across network conditions, or causal identification.
+> In particular, the source-port/CDN-hashing and Nagle/delayed-ACK explanations
+> are hypotheses consistent with the samples, not isolated mechanisms.
+
 The `latency` command measures four different things and never invents values:
 
 1. **Discovery RTT**: wall-clock time around one `Exchange::discover_markets`
@@ -89,10 +95,11 @@ skew and is retained as history.
 | First arrivals (replica 0 / 1) | 36 / 140 | 196 / 20 | 8 / 346 | 36 / 360 |
 | Timestamp-latency p50 | 229,524 µs | 147,670 µs | 192,387 µs | 179,050 µs |
 
-These are four single 60-second observations, not a controlled benchmark. The
-four runs happened at different minutes of the same day on the same network, so
-network conditions varied between them. The findings below are what the data
-supports, no more.
+These are four single 60-second observations, not a controlled benchmark and
+not a causal experiment. The four runs happened at different minutes of the same
+day on the same network, so network conditions varied between them. Each
+configuration was measured once. The findings below distinguish what the
+samples show from mechanisms that remain hypotheses.
 
 ## Findings
 
@@ -103,29 +110,34 @@ supports, no more.
    deliver most events near-simultaneously while the tail is dominated by
    occasional slow paths — exactly the distribution Extension 1's failover
    design assumes.
-2. **Racing four full handshakes looked strictly better in these runs.** The
+2. **Racing four full handshakes looked better in these runs.** The
    winning-of-four connect completed in 636/759 ms versus 1487/1007 ms without
    racing, and the skew tail tightened (p95 5.5 ms versus 27 ms). Racing
    includes the TLS and websocket upgrade, so the winner is the first
    *usable* connection, not merely the first TCP SYN. One pair of runs is weak
-   evidence, but the direction is plausible: an anycast/CDN edge can route
-   otherwise-identical handshakes onto different origin paths, and selecting
-   the first success discards the slow ones.
-3. **Source-port pinning was the worst configuration measured.** Pinning ports
-   51800/51801 produced the slowest connects (3.2 s / 5.3 s), the worst skew
-   (p50 67.8 ms), and a lopsided arrival race (replica 1 first on 346 of 354
-   matched events). A plausible cause is that the venue's CDN hashes the source
-   port when choosing an origin path, so a pinned pair can land on a
-   consistently worse path than two ephemeral ports. The honest conclusion is
-   the inverse of the folklore: **pinning source ports is not a free win; it
-   can pin you to a bad path**. Measure before adopting it, and prefer racing
-   or ephemeral ports on venues fronted by a CDN.
-4. **Disabling `TCP_NODELAY` visibly hurt cross-connection arrival.** The
-   no-NODELAY run's skew p50 was 10.5 ms versus 65 µs for the equivalent
-   NODELAY-on baseline, and its worst matched event arrived 430 ms late. This
-   is the Nagle/delayed-ACK interaction the brief's advice predicts: small
-   order-book frames must not wait for coalescing. `TCP_NODELAY` stays the
-   default.
+   evidence, and the comparison is not controlled for network variation. A
+   plausible, unproven explanation is that an anycast/CDN edge routes
+   otherwise-identical handshakes onto different origin paths, so selecting the
+   first success discards the slow ones.
+3. **Source-port pinning was the worst configuration in this sample.** Pinning
+   ports 51800/51801 produced the slowest connects (3.2 s / 5.3 s), the worst
+   skew (p50 67.8 ms), and a lopsided arrival race (replica 1 first on 346 of
+   354 matched events). **Hypothesis, not established:** the venue's CDN may
+   hash the source port when choosing an origin path, so a pinned pair could
+   land on a consistently worse path than two ephemeral ports. These four runs
+   do not isolate CDN routing from other time-varying network conditions. The
+   supported conclusion is narrower: in this sample, pinning source ports was
+   not a free win and can correlate with a worse path. Measure before adopting
+   it, and prefer racing or ephemeral ports when a CDN is involved.
+4. **Disabling `TCP_NODELAY` correlated with worse cross-connection arrival.**
+   The no-NODELAY run's skew p50 was 10.5 ms versus 65 µs for the NODELAY-on
+   baseline, and its worst matched event arrived 430 ms late. **Hypothesis, not
+   established:** this is consistent with a Nagle/delayed-ACK interaction, in
+   which small order-book frames wait for coalescing, but the runs did not
+   capture packet-level evidence or control for network variation.
+   `TCP_NODELAY` remains the default because it avoids one plausible source of
+   delay at negligible cost; that is a design choice, not a proven causal
+   result from these four observations.
 5. **The venue's initial dump treats the second identical subscription
    differently.** Replica 0's first frame consistently arrived ~3 ms after its
    task started, while replica 1 — subscribed to exactly the same assets a

@@ -4,6 +4,12 @@
 first non-whitespace character is `#` are ignored. Every record carries a local
 `received_at_us` timestamp; timestamps must be non-decreasing across the file.
 
+This non-decreasing rule is a replay-input convenience so the fixture has a
+deterministic event timeline. It is not a claim about live capture output. Live
+SBE file order is the single writer's processing order and can contain
+cross-symbol receive-timestamp regressions; see the timestamp/ordering contract
+in the [README](../README.md#ordering-and-timestamp-contract).
+
 The replay path feeds the same `CollectorCore` used by live collection. It does
 not sleep or contact an exchange. Snapshot scheduling, source selection, and
 failover are therefore driven by fixture timestamps and are deterministic.
