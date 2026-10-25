@@ -332,13 +332,16 @@ pub fn run(settings: Settings, input: &Path) -> anyhow::Result<RunReport> {
                 last_frame_us,
                 last_error,
             } => {
-                let messages = core.handle_status(SourceStatus {
-                    source,
-                    connected,
-                    last_frame_us: last_frame_us.or(Some(received_at_us)),
-                    last_error,
-                    ..SourceStatus::new(source)
-                });
+                let messages = core.handle_status(
+                    SourceStatus {
+                        source,
+                        connected,
+                        last_frame_us: last_frame_us.or(Some(received_at_us)),
+                        last_error,
+                        ..SourceStatus::new(source)
+                    },
+                    received_at_us,
+                );
                 outputs = outputs.saturating_add(messages.len() as u64);
                 write_outputs(&mut writer, messages)?;
                 drain_controls(&mut core);

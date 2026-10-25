@@ -29,7 +29,7 @@ use crate::{
     model::{Control, MarketInfo, OutputMessage, SourceId},
     report::{MarketMetadata, ReportConfig, RunReport, sidecar_path},
     session::{WorkerConfig, WorkerEvent, run_worker},
-    time::{MonotonicClock, now_us},
+    time::now_us,
     writer::WriterHandle,
 };
 
@@ -86,7 +86,6 @@ where
 {
     settings.validate()?;
     let started_at_us = now_us().context("reading wall clock at startup")?;
-    let clock = MonotonicClock::new(started_at_us);
     let exchange = build_exchange(&settings, true)?;
     let initial_markets =
         discover_with_retry(&exchange, settings.collector.max_markets, exchange.name()).await?;
@@ -96,7 +95,8 @@ where
             exchange.name()
         );
     }
-    let shard_count = derive_shard_count(&settings, initial_markets.len());
+    let shard_count = derive_shard_count(&settings, initial_markets.len())
+        .context("deriving the shard count from the discovered symbol set")?;
     let replica_count = settings.collector.replicas;
     let core_config = CoreConfig::from_settings(&settings, shard_count)?;
     let mut core = CollectorCore::new(core_config)?;
@@ -210,9 +210,10 @@ where
                 }
             }
             _ = ticker.tick() => {
-                // Scheduling durations use the monotonic clock; event receive
-                // timestamps remain raw wall-clock readings.
-                let now = clock.now_us();
+                // Every serialized timestamp comes from the wall clock, so
+                // generated snapshots share one timeline with event receive
+                // times. The tick cadence itself is the Tokio timer.
+                let now = now_us().unwrap_or(started_at_us);
                 let outputs = core.tick(now);
                 if let Err(error) = emit_outputs(&writer, outputs, send_timeout).await {
                     fatal = Some(format!("{error:#}"));
@@ -258,7 +259,7 @@ where
                         );
                     }
                     Some(Ok(markets)) => {
-                        let now = clock.now_us();
+                        let now = now_us().unwrap_or(started_at_us);
                         match core.apply_discovery(now, markets) {
                             Ok(outputs) => {
                                 if let Err(error) =
@@ -319,7 +320,7 @@ where
     }
     info!(reason = %shutdown_reason, "shutting down collector");
     let ended_at_us = now_us().unwrap_or(started_at_us);
-    let finalize_at_us = clock.now_us();
+    let finalize_at_us = ended_at_us;
     core.begin_shutdown();
     let mut shutdown_error: Option<anyhow::Error> = None;
     if settings.collector.final_snapshots {
@@ -344,7 +345,7 @@ where
             Ok(Some(WorkerEvent::Status(status))) => {
                 // Preserve final connectivity/counter state for the run
                 // report, but suppress any post-final data output.
-                let _ = core.handle_status(status);
+                let _ = core.handle_status(status, now_us().unwrap_or(0));
             }
             Ok(Some(WorkerEvent::Events { .. } | WorkerEvent::Fatal { .. })) => {
                 // Drop queued data after the final snapshot. Workers are
@@ -401,15 +402,35 @@ where
     Ok(report)
 }
 
-fn derive_shard_count(settings: &Settings, symbol_count: usize) -> usize {
-    if settings.collector.shards > 0 {
-        return settings.collector.shards.clamp(1, 256);
-    }
+/// Choose the shard count for the discovered symbol set.
+///
+/// The per-socket bound is enforced, not advisory: a run that cannot keep
+/// every socket at or below `max_symbols_per_socket` fails at startup. With an
+/// explicit `shards`, the configured count must already satisfy the bound;
+/// with `shards = 0`, the derived count must fit inside `max_shards`.
+fn derive_shard_count(settings: &Settings, symbol_count: usize) -> anyhow::Result<usize> {
     let per_socket = settings.collector.max_symbols_per_socket.max(1);
-    let needed = symbol_count.div_ceil(per_socket).max(1);
-    needed
-        .min(settings.collector.max_shards.max(1))
-        .clamp(1, 256)
+    let shards = if settings.collector.shards > 0 {
+        settings.collector.shards.clamp(1, 256)
+    } else {
+        let needed = symbol_count.div_ceil(per_socket).max(1);
+        anyhow::ensure!(
+            needed <= settings.collector.max_shards.max(1),
+            "discovered {symbol_count} symbols: keeping every socket at or below \
+             {per_socket} symbols needs {needed} shards, above max_shards = {}; \
+             raise max_shards or the per-socket bound",
+            settings.collector.max_shards.max(1)
+        );
+        needed.clamp(1, 256)
+    };
+    let per_shard = symbol_count.div_ceil(shards);
+    anyhow::ensure!(
+        per_shard <= per_socket,
+        "{symbol_count} symbols across {shards} shards would put up to {per_shard} \
+         symbols on one socket, above max_symbols_per_socket = {per_socket}; \
+         increase the shard count or the per-socket bound"
+    );
+    Ok(shards)
 }
 
 async fn discover_with_retry(
@@ -492,7 +513,7 @@ async fn process_worker_event(
             dispatch_controls(core, commands, send_timeout).await?;
         }
         WorkerEvent::Status(status) => {
-            let outputs = core.handle_status(status);
+            let outputs = core.handle_status(status, now_us().unwrap_or(0));
             emit_outputs(writer, outputs, send_timeout).await?;
             dispatch_controls(core, commands, send_timeout).await?;
         }
@@ -568,5 +589,61 @@ async fn wait_for_shutdown_signal() -> String {
     {
         let _ = tokio::signal::ctrl_c().await;
         "SIGINT".to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings(shards: usize, per_socket: usize, max_shards: usize) -> Settings {
+        let mut settings = Settings::load(None).unwrap();
+        settings.collector.shards = shards;
+        settings.collector.max_symbols_per_socket = per_socket;
+        settings.collector.max_shards = max_shards;
+        settings
+    }
+
+    #[test]
+    fn explicit_shard_count_must_satisfy_the_per_socket_bound() {
+        // Below the bound: 9,998 symbols across two shards.
+        assert_eq!(
+            derive_shard_count(&settings(2, 5_000, 64), 9_998).unwrap(),
+            2
+        );
+        // At the bound: exactly 5,000 symbols per shard.
+        assert_eq!(
+            derive_shard_count(&settings(2, 5_000, 64), 10_000).unwrap(),
+            2
+        );
+        // Above the bound: one extra symbol is rejected.
+        let error = derive_shard_count(&settings(2, 5_000, 64), 10_001).unwrap_err();
+        assert!(
+            error.to_string().contains("max_symbols_per_socket"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn automatic_sharding_derives_the_required_count() {
+        assert_eq!(
+            derive_shard_count(&settings(0, 5_000, 64), 20_000).unwrap(),
+            4
+        );
+        assert_eq!(
+            derive_shard_count(&settings(0, 5_000, 64), 20_001).unwrap(),
+            5
+        );
+        // The full max_shards budget is usable...
+        assert_eq!(
+            derive_shard_count(&settings(0, 5_000, 64), 320_000).unwrap(),
+            64
+        );
+        // ...and a need beyond it fails loudly instead of oversubscribing.
+        let error = derive_shard_count(&settings(0, 5_000, 64), 320_001).unwrap_err();
+        assert!(
+            error.to_string().contains("max_shards"),
+            "unexpected error: {error}"
+        );
     }
 }

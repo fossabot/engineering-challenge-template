@@ -800,7 +800,13 @@ impl CollectorCore {
 
     /// Apply a status transition. Losing a source immediately invalidates all of
     /// its shadow books and fails over any symbols where it was active.
-    pub fn handle_status(&mut self, status: SourceStatus) -> Vec<OutputMessage> {
+    ///
+    /// `now_us` is the generation time of this transition. Generated failover
+    /// snapshots carry it, so their local timestamp never precedes the receive
+    /// time of any update included in the replacement book. The lost source's
+    /// own frame time stays in its [`SourceStatus`] and is not reused as a
+    /// snapshot timestamp.
+    pub fn handle_status(&mut self, status: SourceStatus, now_us: i64) -> Vec<OutputMessage> {
         let source = status.source;
         if source.shard as usize >= self.shards.len() {
             return Vec::new();
@@ -827,12 +833,9 @@ impl CollectorCore {
         if self.shutting_down {
             return Vec::new();
         }
-        let now = status
-            .last_frame_us
-            .unwrap_or_else(|| crate::time::now_us().unwrap_or(0));
         let mut outputs = Vec::new();
         for native in affected {
-            outputs.extend(self.reseat(&native, now));
+            outputs.extend(self.reseat(&native, now_us));
         }
         outputs
     }
@@ -1460,7 +1463,8 @@ mod tests {
         );
 
         // The shadow applies its own updates without emitting. Its book is
-        // current when the active source is lost.
+        // current when the active source is lost, and its last update
+        // (NOW + 200) is newer than the active source's last frame (NOW + 50).
         assert!(
             core.handle_event(
                 SOURCE_B,
@@ -1477,24 +1481,40 @@ mod tests {
         );
 
         assert!(
-            core.handle_status(SourceStatus {
-                source: SOURCE_A,
-                connected: true,
-                ..SourceStatus::new(SOURCE_A)
-            })
+            core.handle_status(
+                SourceStatus {
+                    source: SOURCE_A,
+                    connected: true,
+                    ..SourceStatus::new(SOURCE_A)
+                },
+                NOW + 250,
+            )
             .is_empty()
         );
-        let outputs = core.handle_status(SourceStatus {
-            source: SOURCE_A,
-            connected: false,
-            last_frame_us: Some(NOW + 300),
-            ..SourceStatus::new(SOURCE_A)
-        });
+        let outputs = core.handle_status(
+            SourceStatus {
+                source: SOURCE_A,
+                connected: false,
+                last_frame_us: Some(NOW + 50),
+                ..SourceStatus::new(SOURCE_A)
+            },
+            NOW + 300,
+        );
         assert_eq!(outputs.len(), 1);
         let OutputMessage::Snapshot(snapshot) = &outputs[0] else {
             panic!("expected failover snapshot");
         };
+        // The generated snapshot carries the status-processing time, never
+        // the lost source's older last frame: its content includes the
+        // shadow's update from NOW + 200.
         assert_eq!(snapshot.received_at.timestamp_micros(), NOW + 300);
+        assert!(snapshot.received_at.timestamp_micros() >= NOW + 200);
+        // The exchange timestamp is the shadow's own last exchange time, kept
+        // separately from the generated local timestamp.
+        assert_eq!(
+            snapshot.exchange_timestamp.timestamp_micros(),
+            NOW + 200 - 1_000
+        );
         assert_eq!(snapshot.bids[0].price_level, 405_000);
         assert_eq!(snapshot.bids[0].quantity, 11_000_000);
 
@@ -1508,6 +1528,37 @@ mod tests {
         };
         assert_eq!(update.backtest_timestamp.timestamp_micros(), NOW + 400);
         assert_eq!(update.quantity, 4_000_000);
+    }
+
+    #[test]
+    fn generated_snapshots_follow_the_supplied_wall_clock_across_a_step() {
+        let mut core = core();
+        core.apply_discovery(NOW, vec![market("A")]).unwrap();
+        core.drain_controls();
+        core.handle_event(SOURCE_A, snapshot_event("A", 400_000, 600_000, 10));
+
+        // The first periodic snapshot is stamped with the wall-clock time the
+        // caller supplies.
+        let outputs = core.tick(NOW + 61_000_000);
+        assert_eq!(outputs.len(), 1);
+        let OutputMessage::Snapshot(snapshot) = &outputs[0] else {
+            panic!("expected periodic snapshot");
+        };
+        assert_eq!(snapshot.received_at.timestamp_micros(), NOW + 61_000_000);
+
+        // A backward wall-clock step must not emit early: the stored deadline
+        // is still ahead of the stepped time.
+        assert!(core.tick(NOW + 30_000_000).is_empty());
+
+        // Once wall time passes the deadline the snapshot fires with the
+        // supplied time; nothing is clamped to hide the step.
+        let outputs = core.tick(NOW + 122_000_000);
+        assert_eq!(outputs.len(), 1);
+        let OutputMessage::Snapshot(snapshot) = &outputs[0] else {
+            panic!("expected periodic snapshot");
+        };
+        assert_eq!(snapshot.received_at.timestamp_micros(), NOW + 122_000_000);
+        assert_eq!(core.stats().periodic_snapshots, 2);
     }
 
     #[test]
@@ -1545,19 +1596,25 @@ mod tests {
         core.handle_event(SOURCE_A, snapshot_event("A", 400_000, 600_000, 10));
         core.handle_event(SOURCE_B, snapshot_event("A", 410_000, 590_000, 12));
         assert!(
-            core.handle_status(SourceStatus {
-                source: SOURCE_A,
-                connected: true,
-                ..SourceStatus::new(SOURCE_A)
-            })
+            core.handle_status(
+                SourceStatus {
+                    source: SOURCE_A,
+                    connected: true,
+                    ..SourceStatus::new(SOURCE_A)
+                },
+                NOW,
+            )
             .is_empty()
         );
 
-        let outputs = core.handle_status(SourceStatus {
-            source: SOURCE_A,
-            connected: false,
-            ..SourceStatus::new(SOURCE_A)
-        });
+        let outputs = core.handle_status(
+            SourceStatus {
+                source: SOURCE_A,
+                connected: false,
+                ..SourceStatus::new(SOURCE_A)
+            },
+            NOW + 1,
+        );
         assert_eq!(outputs.len(), 1);
         let OutputMessage::Snapshot(snapshot) = &outputs[0] else {
             panic!("expected failover snapshot");
