@@ -311,6 +311,36 @@ impl MetricsRegistry {
         let now = now_us().unwrap_or(self.started_at_us);
         (now.saturating_sub(self.started_at_us)) as f64 / 1_000_000.0
     }
+
+    /// JSON readiness payload served by `/healthz`.
+    ///
+    /// `status` is `starting` before any source has reported, `ok` when every
+    /// configured source is connected, and `degraded` when at least one source
+    /// is down. The endpoint always answers 200 OK: the process is alive
+    /// whenever it can answer, and the payload states whether it is also
+    /// fully serving.
+    #[must_use]
+    pub fn health_payload(&self) -> String {
+        let snapshot = self.snapshot();
+        let total = snapshot.sources.len();
+        let connected = snapshot
+            .sources
+            .iter()
+            .filter(|source| source.connected)
+            .count();
+        let status = if total == 0 {
+            "starting"
+        } else if connected == total {
+            "ok"
+        } else {
+            "degraded"
+        };
+        format!(
+            "{{\"status\":\"{status}\",\"uptime_seconds\":{:.3},\
+             \"sources_connected\":{connected},\"sources_total\":{total}}}\n",
+            self.uptime_seconds()
+        )
+    }
 }
 
 /// Serve on an already-bound listener. The coordinator binds during startup so
@@ -347,10 +377,7 @@ pub async fn run_server_on(
                         "/healthz" => (
                             "200 OK",
                             "application/json",
-                            format!(
-                                "{{\"status\":\"ok\",\"uptime_seconds\":{:.3}}}\n",
-                                registry.uptime_seconds()
-                            ),
+                            registry.health_payload(),
                         ),
                         _ => ("404 Not Found", "text/plain", "not found\n".to_owned()),
                     };
@@ -366,4 +393,46 @@ pub async fn run_server_on(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registry_with(sources: &[(u16, u16, bool)]) -> MetricsRegistry {
+        let registry = MetricsRegistry::new("polymarket");
+        let mut statuses = BTreeMap::new();
+        for (shard, replica, connected) in sources {
+            let source = SourceId::new(*shard, *replica);
+            statuses.insert(
+                source,
+                SourceStatus {
+                    source,
+                    connected: *connected,
+                    ..SourceStatus::new(source)
+                },
+            );
+        }
+        registry.update(CollectorStats::default(), WriterStats::default(), &statuses);
+        registry
+    }
+
+    #[test]
+    fn health_status_reflects_source_connectivity() {
+        let starting = registry_with(&[]).health_payload();
+        assert!(starting.contains("\"status\":\"starting\""));
+        assert!(starting.contains("\"sources_total\":0"));
+
+        let healthy = registry_with(&[(0, 0, true), (0, 1, true)]).health_payload();
+        assert!(healthy.contains("\"status\":\"ok\""));
+        assert!(healthy.contains("\"sources_connected\":2"));
+        assert!(healthy.contains("\"sources_total\":2"));
+
+        // One shard with both replicas down must not report ok.
+        let degraded =
+            registry_with(&[(0, 0, true), (1, 0, false), (1, 1, false)]).health_payload();
+        assert!(degraded.contains("\"status\":\"degraded\""));
+        assert!(degraded.contains("\"sources_connected\":1"));
+        assert!(degraded.contains("\"sources_total\":3"));
+    }
 }

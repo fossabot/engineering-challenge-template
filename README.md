@@ -31,7 +31,9 @@ offline gate results.
   lower-clock shadow is reconnected instead of being promoted.
 - Handles SIGINT and SIGTERM: stops discovery, emits final snapshots, closes
   websockets, flushes and syncs the SBE file, and writes the sidecars.
-- Exposes dependency-free Prometheus text metrics and `/healthz` when configured.
+- Exposes dependency-free Prometheus text metrics and `/healthz` when
+  configured; `/healthz` reports `starting`, `ok`, or `degraded` with
+  connected and total source counts.
 - Provides deterministic JSONL replay, an offline SBE inspector, and a `verify`
   command that proves a capture's deltas reconstruct the snapshots that follow
   them.
