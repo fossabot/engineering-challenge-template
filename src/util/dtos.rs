@@ -43,7 +43,7 @@ macro_rules! schemas {
     )*};
 }
 
-/// This trait allows us to encode multiple SBE schemas using the same function.
+/// Encodes multiple SBE schemas through one interface.
 pub trait SbeEncode {
     /// Returns the exact encoded length, including the SBE message header.
     fn encoded_length_with_header(&self) -> anyhow::Result<usize>;

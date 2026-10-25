@@ -1,14 +1,12 @@
-//! Defines the [`AlignedSbeReader`], which allows us to quickly read SBE
-//! messages written by the
-//! [`AlignedSbeWriter`](crate::util::aligned_sbe_writer::AlignedSbeWriter).
+//! Defines the [`AlignedSbeReader`], a fast reader for SBE messages written by
+//! the [`AlignedSbeWriter`](crate::util::aligned_sbe_writer::AlignedSbeWriter).
 
 use std::{fs::File, io, marker::PhantomData, os::unix::fs::FileExt, path::Path};
 
 use anyhow::Context;
 use crossbeam::channel::{Receiver, Sender, bounded};
 
-/// Any SBEs we want to read with the AlignedSbeReader must implement this
-/// trait.
+/// Every SBE schema read by the [`AlignedSbeReader`] implements this trait.
 pub trait AlignedSbeSchema: 'static {
     const SCHEMA_ID: u16;
     const SCHEMA_VERSION: u16;
@@ -32,28 +30,23 @@ const HEADER_LENGTH: usize = 8;
 /// See [`AlignedSbeReader::create_prefetch_task`] for more details.
 pub type PrefetchTask = Box<dyn FnOnce() + Send + 'static>;
 
-/// The [`AlignedSbeReader`] is designed to solve the issue of reading partial
-/// messages from SBE flat files. Some background:
+/// The [`AlignedSbeReader`] solves the problem of partial messages in SBE flat
+/// files.
 ///
-/// We want to read aeron-spec SBEs from disk at extremely fast speeds -- 100M
-/// messages/sec on a single reader thread (with another prefetch thread/task in
-/// the background).
+/// The design targets aeron-spec SBE reads from disk at very high rates -- 100M
+/// messages/sec on a single reader thread, with another prefetch thread/task in
+/// the background -- through a small API: reads are prefetched and the file is
+/// read in big chunks ([`DEFAULT_CHUNK_SIZE`]). Reading in chunks alone allows a
+/// message to tear across a chunk boundary, which forces the prefetch logic and
+/// the reader to coordinate finishing the truncated message on the next chunk.
 ///
-/// Additionally, we wanted a very simple API to do so. To achieve this, we
-/// prefetch our reads, and read in big chunks ([`DEFAULT_CHUNK_SIZE`]). However, when
-/// you read in chunks, messages might tear across the chunk boundary. This is
-/// undesireable, because now we need to coordinate our prefetch with our
-/// reader, in case we need to read the next chunk to finish the currenet
-/// message that is truncated on the current chunk.
+/// The aligned format removes that coordination: **Write the encoded SBE
+/// messages all-or-nothing, aligned to the chunk size.** If the next message
+/// would tear across two chunks, the rest of the current chunk is zero-padded
+/// and the message is written in full at the start of the next chunk.
 ///
-/// This is annoying AF, so to solve the problem, we moved upstream: **Write the
-/// encoded SBE messages all-or-nothing, aligned to the chunk size.** If we are
-/// writing messages and we find that the next message will tear across two
-/// chunks, we simply pad the rest of the current chunk with zeros, and write
-/// the message, in full, starting at the next chunk.
-///
-/// This way the reader can then see the zeros, know the chunk is done, and skip
-/// to the next one.
+/// The reader sees the zeros, treats the chunk as finished, and skips to the
+/// next one.
 pub struct AlignedSbeReader<T: AlignedSbeSchema> {
     file: Option<File>,
     file_len: u64,
@@ -233,10 +226,10 @@ impl<T: AlignedSbeSchema> AlignedSbeReader<T> {
         Ok(true)
     }
 
-    /// Decode the next message from our chunk buffer.
+    /// Decode the next message from the chunk buffer.
     ///
-    /// Returns `Ok(None)` once we reach the end of the file, and `Err(...)` if
-    /// there is an erroring reading the file, decoding the next message, etc.
+    /// Returns `Ok(None)` at the end of the file and `Err(...)` on a file read
+    /// or message decode failure.
     pub fn read_msg(&mut self) -> anyhow::Result<Option<T::Message<'_>>> {
         loop {
             let header_end = self
