@@ -112,7 +112,7 @@ measured once.
    winning-of-four connect completed in 636/759 ms versus 1487/1007 ms without
    racing, and the skew tail tightened (p95 5.5 ms versus 27 ms). Racing
    includes the TLS and websocket upgrade, so the winner is the first
-   *usable* connection, not merely the first TCP SYN. One pair of runs is weak
+   *usable* connection, selected after the full handshake. One pair of runs is weak
    evidence, and the comparison is not controlled for network variation. A
    plausible, unproven explanation is that an anycast/CDN edge routes
    otherwise-identical handshakes onto different origin paths, so selecting the

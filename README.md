@@ -19,7 +19,9 @@ offline gate results.
   without restarting the process.
 - Assigns symbols to a fixed number of shards at startup, then keeps the
   assignment stable. If `collector.shards = 0`, the initial shard count is
-  derived from the symbol count and `max_symbols_per_socket`.
+  derived from the symbol count and `max_symbols_per_socket`. The per-socket
+  bound is enforced: a run that cannot keep every socket at or below it fails
+  at startup instead of oversubscribing a connection.
 - Opens `collector.replicas` websocket connections per shard. Every replica
   maintains a full shadow book; one source is active per symbol.
 - Writes a full snapshot every 60 seconds and on failover, recovery, removal,
@@ -266,17 +268,17 @@ exists, the local receive time is used.
 - Per symbol, the first full snapshot anchors the book; later deltas apply to
   the most recent snapshot in file order. Failover, recovery, removal, periodic,
   and final snapshots are emitted before any resumed deltas.
-- Generated snapshots are timestamped from the triggering status or processing
-  time. A failover snapshot uses the lost source's last-frame time (or the
-  current clock when none exists). Because status and data events arrive on
-  different worker channels, that generated timestamp can be a few microseconds
-  older than the last delta written before it. It is still the actual evidence
-  time, not a rewritten event timestamp.
-- Durations, retries, and timeouts use monotonic time: session backoff and
-  timeouts use `Instant`/Tokio timers, and the live collector's snapshot/probe
-  tick uses `MonotonicClock` anchored at startup. Event receive timestamps use
-  the wall clock. Replay uses fixture timestamps so the core remains
-  deterministic.
+- Generated snapshots are stamped with the wall-clock time at which they are
+  produced, so they share one timeline with event receive times. A failover
+  snapshot therefore carries the status-processing time, which never precedes
+  the receive time of any update included in the replacement book; the lost
+  source's last-frame time stays in its source status, and the shadow's last
+  exchange timestamp is preserved as the snapshot's exchange timestamp.
+- Durations, retries, and timeouts use monotonic timers (`Instant`/Tokio) and
+  are never serialized. Every serialized timestamp — event receive times and
+  generated snapshots — comes from the wall clock; a wall-clock step moves the
+  timeline for both consistently, with no clamping. Replay uses fixture
+  timestamps so the core remains deterministic.
 - No bounded reordering buffer is implemented. Global chronological output is
   not a contract; sorting a capture by timestamp is not equivalent to
   replaying it, so a consumer that needs a sorted stream must buffer
@@ -363,8 +365,9 @@ seven scenarios are:
    reports the mismatch instead of claiming completeness;
 4. discovery churn: a removed symbol ends with an empty retirement snapshot and
    a new symbol starts with its own snapshot;
-5. silent subscription: suppressed updates trigger a stale probe,
-   reconnect/resubscribe, and a repair snapshot;
+5. silent subscription: suppressed updates trigger a stale probe that cycles
+   the subscription on the live connection, and the repair book arrives as a
+   fresh exchange snapshot;
 6. negative control: a missing update is detected when a later non-empty
    snapshot exposes it;
 7. subscription scale: 1,000 symbols, 4 shards, 2 replicas, 8 WebSockets, 250
@@ -413,7 +416,8 @@ matching CLI flags) and apply to `collect` as well as `latency`:
   with racing.
 - `connect_race` opens that many full TCP + TLS + websocket handshakes
   concurrently and keeps the first success; the losers are closed. Racing
-  includes the websocket upgrade, not just the TCP SYN.
+  covers the entire handshake through the websocket upgrade, so the winner is
+  a usable connection.
 
 An authentication rejection (HTTP 401/403) is never raced away: it fails
 immediately so credential errors stay diagnosable.
@@ -462,7 +466,7 @@ settings:
 |---|---:|---|
 | `collector.shards` | 4 | Fixed shard count; `0` derives it |
 | `collector.replicas` | 2 | Redundant sockets per shard |
-| `collector.max_symbols_per_socket` | 5000 | Soft capacity used to derive shards when `collector.shards = 0` |
+| `collector.max_symbols_per_socket` | 5000 | Enforced per-socket bound; used to derive shards when `collector.shards = 0` |
 | `collector.max_shards` | 64 | Upper bound when deriving shards automatically |
 | `collector.snapshot_interval_secs` | 60 | Full local snapshot cadence |
 | `collector.discovery_interval_secs` | 30 | Discovery reconciliation cadence |
@@ -478,6 +482,7 @@ settings:
 | `network.source_ip` | none | Local IP to bind before connecting |
 | `network.source_port` | none | Base local source port; connection `shard*256+replica` binds `base + ordinal`; not combinable with `connect_race > 1` |
 | `network.connect_race` | 1 | Simultaneous full handshakes; the first success is kept |
+| `network.connect_timeout_secs` | 30 | Deadline for one full connection attempt, including every raced candidate |
 | `polymarket.discovery_page_size` | 100 | Gamma keyset page size; the endpoint accepts at most 100 |
 | `polymarket.require_accepting_orders` | true | Only an explicit `acceptingOrders == true` is tradable |
 | `output.chunk_size` | 67108864 | Power-of-two chunk; defaults to 64 MiB for template-reader compatibility. Padding is written only on chunk rotation and at close |
@@ -500,7 +505,7 @@ src/
   verify.rs           capture self-consistency verification
   latency.rs          measured latency, connection setup, and cross-replica skew
   report.rs           atomic run-report and metadata sidecars
-  time.rs             wall-clock timestamps and the monotonic scheduling clock
+  time.rs             wall-clock timestamp helpers and conversions
   ws.rs               websocket transport: TCP_NODELAY, source binding, racing
   util/               supplied aligned SBE helpers and generated DTOs
 fixtures/             deterministic replay fixture
@@ -522,8 +527,10 @@ measurements/         exact measured reports from public runs
 - Kalshi endpoint reachability depends on the environment. The adapter
   supports production (the default) and demo; switch explicitly to demo for
   simulated validation.
-- Polymarket is a public, best-effort feed with no sequence numbers. Recovery is
-  reconnect-and-resubscribe. Its event timestamps are not a send-time clock.
+- Polymarket is a public, best-effort feed with no sequence numbers. Protocol
+  faults recover by reconnect-and-resubscribe; quiet-symbol probes cycle the
+  subscription on the live connection instead. Its event timestamps are not a
+  send-time clock.
 - `inspect --read-chunk-size auto` streams candidate chunks from disk instead of
   reading the whole file into memory, and never considers a chunk larger than
   256 MiB; captures written with a larger chunk need an explicit

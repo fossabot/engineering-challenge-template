@@ -256,3 +256,171 @@ with the next full snapshot (`src/verify.rs`).
 Open proof obligations: Q6 (venue-side transient omission), V-1 (external
 message-count check), V-2 (inherent self-consistency limit). Phase 2 (fault
 injection at the transport and discovery boundaries) starts from this branch.
+
+## Phase 2: session, sharding, and timestamp hardening
+
+The second review pass raised seven findings against the baseline. Each is
+recorded here with its disposition on this branch. Severity scale: high,
+moderate, low. The baseline commit `d4ab66d` is unchanged.
+
+### F1: quiet-symbol probes recycled the entire Polymarket socket (high)
+
+- Invariant: a quiet symbol is probed and repaired without disturbing the
+  connection's other subscriptions.
+- Code: `tick` queues a snapshot request after `stale_probe_after_secs`;
+  `PolymarketSession::request_snapshot` returned `SessionFailure::Reconnect`,
+  which the supervisor treats as dropping the socket. The first probe
+  therefore recycled every subscription on the connection and forced a fresh
+  initial dump, bypassing the `max_probes` budget.
+- Counterexample: any shard with a symbol that has no `price_change` events
+  for the probe threshold (120 s by default) — common in a large,
+  low-activity universe — reconnected roughly every two minutes and produced
+  a burst of re-anchoring snapshots.
+- Fix: `request_snapshot` cycles the asset's subscription on the live
+  connection (unsubscribe, then subscribe, batched by `batch_size`). Recovery
+  is still only accepted when the venue's fresh book arrives and anchors the
+  core state; a venue that sends nothing leaves the probe budget to escalate
+  to the existing reconnect path.
+- Regression tests:
+  `exchange::polymarket::session::tests::request_snapshot_cycles_the_subscription_on_the_live_connection`
+  (mock market-channel server asserts the unsubscribe/subscribe pair on the
+  same connection and the fresh book that follows), and the E2E
+  `silent_subscription_is_detected_and_repaired` now asserts the repair opens
+  no new connection (`next_id` unchanged, zero source switches, zero
+  reconnects).
+- Live proof: `tests/live_polymarket.rs::resubscribing_an_asset_returns_a_fresh_book`
+  ran against the public venue on this branch and passed: cycling a
+  subscription produced a fresh authoritative book on the same connection.
+  Both live tests passed in 13.0 s.
+- Verification: unit, protocol, E2E, and live all pass.
+
+### F2: failover snapshots could predate their content (high)
+
+- Invariant: a generated failover snapshot's local timestamp must not precede
+  the receive time of any update included in the replacement book.
+- Code: `handle_status` derived the snapshot generation time from the lost
+  source's `last_frame_us`, while `reseat` stamped the shadow book, which can
+  contain newer updates.
+- Counterexample: an active source whose last frame predates the shadow's
+  last update (for example a half-open connection detected through the 45 s
+  idle timeout) produced a snapshot whose `backtest_timestamp` preceded data
+  it contained — look-ahead for a consumer replaying the timeline.
+- Fix: `handle_status` takes an explicit generation time; the coordinator
+  passes the wall clock, replay passes the record timestamp. The lost
+  source's last-frame time stays in its `SourceStatus`, and the shadow's last
+  exchange timestamp is preserved as the snapshot's exchange timestamp.
+- Regression test: `failover_snapshot_anchors_resumed_deltas_and_preserves_receive_times`
+  now builds an active book at NOW and a shadow updated at NOW + 200, marks
+  the active source down with `last_frame_us = NOW + 50` and generation time
+  NOW + 300, then asserts the snapshot carries NOW + 300 (never the older
+  frame time), that it is at or after the shadow's availability time, and
+  that the shadow's exchange timestamp is preserved separately.
+- Verification: test passes; replay and E2E paths updated.
+
+### F3: websocket setup had no bounded deadline (high)
+
+- Invariant: one connection attempt — DNS resolution, TCP connect, TLS
+  negotiation, and the websocket upgrade, across every raced candidate —
+  completes or fails within a configured deadline.
+- Code: `run_worker` awaited `connect()` without a timeout, and `ws::connect`
+  awaited resolution and the handshake race without an end-to-end bound.
+- Counterexample: a server that accepts TCP but stalls the upgrade left the
+  source worker unable to process shutdown or reconnect controls until the
+  coordinator's outer shutdown timeout aborted it.
+- Fix: `network.connect_timeout_secs` (default 30, validated 1–600) flows
+  into `ConnectOptions::connect_timeout`; `ws::connect` bounds the whole
+  attempt and returns a transient error that the supervisor retries with
+  backoff.
+- Regression tests: `ws::tests::stalled_handshake_is_bounded_by_the_connect_timeout`
+  (localhost server accepts TCP, never upgrades) and
+  `session::tests::stalled_connect_reports_status_and_stops_cleanly` (the
+  worker reports the failure with `last_error` containing "timed out" and
+  still stops promptly on shutdown).
+- Verification: both tests pass; the setting is covered by validation tests.
+
+### F4: the per-socket bound was advisory, not enforced (moderate)
+
+- Invariant: `ceil(symbols / shards) <= max_symbols_per_socket` for every
+  run; automatic sharding never silently exceeds `max_shards`.
+- Code: `derive_shard_count` returned an explicit shard count without
+  checking the bound, and in automatic mode capped the derived count at
+  `max_shards` without failing when the cap still violated the per-socket
+  bound.
+- Counterexample: the full-universe discovery set (548,942 tokens) with the
+  default `shards = 4` would have attempted initial subscription frames of
+  roughly 137k asset ids per socket.
+- Fix: `derive_shard_count` now returns a result and rejects an incompatible
+  run at startup: explicit shard counts must satisfy the bound, and automatic
+  sharding fails loudly when the required count exceeds `max_shards`.
+- Regression tests: `coordinator::tests::{explicit_shard_count_must_satisfy_the_per_socket_bound,automatic_sharding_derives_the_required_count}`
+  cover immediately below, at, and above both limits.
+- Verification: tests pass; README and the requirement matrix state the
+  enforced bound.
+
+### F5: two timestamp bases fed one output timeline (moderate)
+
+- Invariant: every serialized timestamp — event receive times and generated
+  snapshots — comes from one clock; monotonic time is used only for
+  durations, retries, and timeouts, and is never serialized.
+- Code: receive timestamps came from `now_us()`, while generated periodic,
+  removal, and final snapshots took `MonotonicClock::now_us()` (wall anchor
+  plus `Instant` elapsed). A laptop sleep stalls the monotonic part and NTP
+  steps move the wall part, so the two diverged.
+- Fix: `MonotonicClock` is removed; the coordinator stamps all generated
+  output with `now_us()`, and Tokio timers (already monotonic) provide the
+  tick cadence. A backward wall step delays a due snapshot rather than
+  emitting early; a forward step fires it immediately. Nothing is clamped.
+- Regression test: `generated_snapshots_follow_the_supplied_wall_clock_across_a_step`
+  exercises a backward step (no early emission) and a forward pass of the
+  deadline (snapshot stamped with the supplied time).
+- Verification: test passes; README and the requirement matrix state the
+  single-timeline contract.
+
+### F6: the pending-frame buffer buffered nothing (moderate)
+
+- Invariant: dropping the supervisor's frame-read future mid-poll loses no
+  frame.
+- Code: `next_frame_buffered` stored the frame into `pending` and took it in
+  the same synchronous step; no await separates the two, so the buffer never
+  carried a frame across a suspension.
+- Fix: the wrapper is removed; the `select!` calls the session read directly.
+  Cancellation safety is a session-contract property: read state lives in the
+  transport, a decoded data frame is returned without further await points,
+  and Polymarket's pending PONG is carried across calls. Kalshi control-frame
+  handling that does await is re-driven by its acknowledgement timeout.
+- Regression test: `ws::tests::dropping_a_read_future_loses_no_frame` polls a
+  read, drops it while pending, and asserts both frames still arrive in
+  order.
+- Verification: test passes; the E2E suite exercises the same supervisor
+  select with the real adapters.
+
+### F7: operational details corrected (low)
+
+- `src/config.rs` described flushes as padding to the chunk boundary; the
+  writer pads only on rotation and close. The comment now matches the writer.
+- Prometheus output typed every metric as a gauge. Cumulative families are
+  now emitted as `counter`, gauges remain `gauge`, and
+  `collector_sources_total` was renamed `collector_sources_configured`
+  because it is a configured count, not a cumulative total. Test:
+  `metrics::tests::prometheus_types_split_gauges_and_counters`.
+- Two weak `orderbook` assertions accepted any error; both now match the
+  exact error variant (`DuplicateLevel` for duplicate asks,
+  `NegativeQuantity` for a negative level).
+- The health payload test now also covers every source failing (degraded,
+  never ok); the readiness policy was already recorded in Phase 1.
+
+## Phase 2 verification on this branch
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | Pass |
+| `cargo clippy --all-targets --locked -- -D warnings` | Pass |
+| `cargo test --all-targets --locked` | Pass: **130 library tests + 7 mock-exchange E2E tests + 2 replay integration tests = 139 passed**, 2 live tests ignored |
+| `cargo test --doc --locked` | Pass: 0 documentation tests |
+| `cargo build --release --locked` | Pass |
+| `RUN_LIVE_TESTS=1 cargo test --test live_polymarket -- --ignored` | Pass: 2/2 against the public venue (discovery/subscribe smoke and the resubscribe probe) |
+
+Wording sweep on this branch: zero matches for historical/grader wording,
+unfinished markers, first-person prose, and intent-adverb/idiom candidates in
+the tracked tree; the supplied template helper comments were rewritten in
+third person.
