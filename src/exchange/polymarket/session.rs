@@ -219,13 +219,36 @@ impl MarketDataSession for PolymarketSession {
             .map_err(SessionFailure::Reconnect)
     }
 
-    async fn request_snapshot(&mut self, _symbols: &[String]) -> Result<(), SessionFailure> {
-        // Polymarket has no get_snapshot command. Returning Reconnect makes the
-        // supervisor drop this socket and resubscribe with `initial_dump`, which
-        // is the protocol's only way to obtain a fresh full book.
-        Err(SessionFailure::Reconnect(anyhow::anyhow!(
-            "Polymarket has no snapshot request; reconnecting for a fresh initial dump"
-        )))
+    async fn request_snapshot(&mut self, symbols: &[String]) -> Result<(), SessionFailure> {
+        if symbols.is_empty() {
+            return Ok(());
+        }
+        // The market channel has no snapshot command. Cycling the subscription
+        // for these assets on the live connection makes the venue treat them
+        // as new subscriptions and emit a fresh book for each. The core only
+        // accepts the recovery once that book arrives as an exchange
+        // snapshot; a venue that sends nothing leaves the probe budget to
+        // escalate to a full reconnect.
+        let chunk_size = self.settings.batch_size.max(1);
+        for chunk in symbols.chunks(chunk_size) {
+            self.send_json(json!({
+                "operation": "unsubscribe",
+                "assets_ids": chunk
+            }))
+            .await?;
+        }
+        for asset in symbols {
+            self.subscribed_assets.remove(asset);
+        }
+        for chunk in symbols.chunks(chunk_size) {
+            self.send_json(json!({
+                "operation": "subscribe",
+                "assets_ids": chunk
+            }))
+            .await?;
+            self.subscribed_assets.extend(chunk.iter().cloned());
+        }
+        Ok(())
     }
 
     async fn close(&mut self) {
@@ -235,5 +258,136 @@ impl MarketDataSession for PolymarketSession {
         self.subscribed_assets.clear();
         self.initial_sent = false;
         self.pong_pending = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::{Value, json};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
+
+    use super::*;
+    use crate::model::ExchangeEvent;
+
+    type ServerWs = WebSocketStream<tokio::net::TcpStream>;
+
+    async fn read_json(ws: &mut ServerWs) -> Value {
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("server read timed out")
+                .expect("server stream ended")
+                .expect("server websocket error");
+            match message {
+                Message::Text(text) => {
+                    return serde_json::from_str(&text).expect("client sent non-JSON");
+                }
+                Message::Ping(_) | Message::Pong(_) => continue,
+                other => panic!("unexpected client frame: {other:?}"),
+            }
+        }
+    }
+
+    async fn send_json(ws: &mut ServerWs, value: Value) {
+        ws.send(Message::Text(value.to_string().into()))
+            .await
+            .unwrap();
+    }
+
+    fn book_frame(asset: &str, price: &str, size: &str) -> Value {
+        json!({
+            "event_type": "book",
+            "asset_id": asset,
+            "market": "mock",
+            "bids": [{"price": price, "size": size}],
+            "asks": [],
+            "timestamp": "1700000000000",
+            "hash": "mock",
+        })
+    }
+
+    async fn next_snapshot(session: &mut PolymarketSession, asset: &str) -> (i64, i64) {
+        for _ in 0..40 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), session.next_frame())
+                .await
+                .expect("client frame timed out")
+                .expect("client frame failed");
+            for event in frame.events {
+                if let ExchangeEvent::Snapshot {
+                    native_symbol,
+                    book,
+                    ..
+                } = event
+                    && native_symbol == asset
+                {
+                    let level = book.bids.first().expect("bid level");
+                    return (level.price, level.quantity);
+                }
+            }
+        }
+        panic!("no snapshot for {asset}");
+    }
+
+    #[tokio::test]
+    async fn request_snapshot_cycles_the_subscription_on_the_live_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+
+            // Initial subscription: one market frame with an initial dump.
+            let initial = read_json(&mut ws).await;
+            assert_eq!(initial["type"], "market");
+            assert_eq!(initial["initial_dump"], true);
+            assert_eq!(initial["assets_ids"], json!(["a"]));
+            send_json(&mut ws, book_frame("a", "0.4", "10")).await;
+
+            // The probe must cycle the subscription on this same connection
+            // instead of dropping it.
+            let unsubscribe = read_json(&mut ws).await;
+            assert_eq!(unsubscribe["operation"], "unsubscribe");
+            assert_eq!(unsubscribe["assets_ids"], json!(["a"]));
+            let subscribe = read_json(&mut ws).await;
+            assert_eq!(subscribe["operation"], "subscribe");
+            assert_eq!(subscribe["assets_ids"], json!(["a"]));
+            send_json(&mut ws, book_frame("a", "0.5", "12")).await;
+
+            // Hold the connection open until the client closes it.
+            while let Some(message) = ws.next().await {
+                if message.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let settings = PolymarketSettings {
+            ws_url: format!("ws://{address}"),
+            ..PolymarketSettings::default()
+        };
+        let mut session = PolymarketSession::new(settings, ConnectOptions::default());
+        session.connect().await.unwrap();
+        session
+            .apply_subscriptions(&BTreeSet::from(["a".to_owned()]))
+            .await
+            .unwrap();
+        assert_eq!(
+            next_snapshot(&mut session, "a").await,
+            (400_000, 10_000_000)
+        );
+
+        session.request_snapshot(&["a".to_owned()]).await.unwrap();
+        assert_eq!(
+            next_snapshot(&mut session, "a").await,
+            (500_000, 12_000_000)
+        );
+
+        session.close().await;
+        server.await.unwrap();
     }
 }

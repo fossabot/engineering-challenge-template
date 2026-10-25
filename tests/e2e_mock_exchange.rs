@@ -1455,13 +1455,29 @@ async fn silent_subscription_is_detected_and_repaired() {
     sleep(Duration::from_millis(200)).await;
     let quiet_truth = mock.book("asset-a");
 
-    let previous_next_id = mock.next_id();
+    let connections_before = mock.next_id();
     mock.set_suppress_deltas(true);
     let quiet_started = tokio::time::Instant::now();
-    mock.wait_for_new_connection(previous_next_id).await;
+    // The stale probe must repair the quiet symbol by cycling its
+    // subscription on the live connection. No new websocket may be opened.
+    wait_until_for(
+        Duration::from_secs(20),
+        "a quiet-symbol resubscribe",
+        &mut || {
+            mock.subscription_log().iter().any(|frame| {
+                frame.operation == "unsubscribe" && frame.connection < connections_before
+            })
+        },
+    )
+    .await;
     assert!(
         quiet_started.elapsed() >= Duration::from_secs(9),
-        "reconnect happened before the stale-probe threshold"
+        "resubscribe happened before the stale-probe threshold"
+    );
+    assert_eq!(
+        mock.next_id(),
+        connections_before,
+        "the repair must stay on the existing connection"
     );
     mock.set_suppress_deltas(false);
     sleep(Duration::from_millis(300)).await;
@@ -1487,13 +1503,17 @@ async fn silent_subscription_is_detected_and_repaired() {
         "silent repair should leave a self-consistent capture: {summary:?}"
     );
     assert!(report.core.stale_probes >= 1);
-    // Polymarket has no snapshot-request command, so a stale probe makes the
-    // supervisor reconnect that socket and resubscribe for a fresh dump. That
-    // is a source switch/failover even though it does not take the core's
-    // direct reseat path counted by `stale_failovers`.
-    assert!(report.core.source_switches >= 1);
-    assert!(report.core.failover_snapshots >= 1);
-    assert!(report.sources.iter().any(|source| source.reconnects >= 1));
+    // The repair stays on the live connection: the probe cycles the
+    // subscription, so no source switch, failover, or reconnect is involved.
+    assert_eq!(report.core.source_switches, 0);
+    assert_eq!(report.core.failover_snapshots, 0);
+    assert!(report.sources.iter().all(|source| source.reconnects == 0));
+    let log = mock.subscription_log();
+    assert!(
+        log.iter()
+            .any(|frame| frame.operation == "subscribe" && !frame.initial),
+        "the resubscribe must re-add the asset"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
