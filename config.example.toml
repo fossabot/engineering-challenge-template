@@ -45,6 +45,9 @@ tcp_nodelay = true
 # source_ip = "192.0.2.10"
 # source_port = 40000
 connect_race = 1
+# Deadline for one full connection attempt (DNS, TCP, TLS, websocket upgrade,
+# including every raced candidate).
+connect_timeout_secs = 30
 
 [output]
 path = "captures/kalshi.sbe"

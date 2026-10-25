@@ -185,8 +185,8 @@ impl Default for CollectorSettings {
             // Output-visibility contract: every interval that received any
             // message ends with a flush, so a downstream reader sees an
             // accepted delta within ~1 second instead of waiting for a full
-            // chunk or shutdown. Each flush pads to the chunk boundary, so a
-            // quiet-but-active capture trades padding bytes for low latency.
+            // chunk or shutdown. Flushes write only the encoded bytes;
+            // padding is written on chunk rotation and at close.
             flush_interval_secs: 1,
             max_markets: 0,
             duration_secs: 0,
@@ -255,6 +255,11 @@ pub struct NetworkSettings {
     /// successful connection is retained and the rest are closed. One means
     /// no racing.
     pub connect_race: usize,
+    /// Deadline for one full connection attempt: DNS resolution, TCP connect,
+    /// TLS negotiation, and the websocket upgrade, including every raced
+    /// candidate. A stalled handshake fails like any other transient error
+    /// instead of wedging the source.
+    pub connect_timeout_secs: u64,
 }
 
 impl Default for NetworkSettings {
@@ -264,6 +269,7 @@ impl Default for NetworkSettings {
             source_ip: None,
             source_port: None,
             connect_race: 1,
+            connect_timeout_secs: 30,
         }
     }
 }
@@ -277,6 +283,7 @@ impl NetworkSettings {
             source_ip: self.source_ip,
             source_port: self.source_port,
             attempts: self.connect_race,
+            connect_timeout: std::time::Duration::from_secs(self.connect_timeout_secs.max(1)),
         }
     }
 }
@@ -411,6 +418,14 @@ impl Settings {
         anyhow::ensure!(
             (1..=8).contains(&self.network.connect_race),
             "network.connect_race must be in [1, 8]"
+        );
+        anyhow::ensure!(
+            self.network.connect_timeout_secs >= 1,
+            "network.connect_timeout_secs must be >= 1"
+        );
+        anyhow::ensure!(
+            self.network.connect_timeout_secs <= 600,
+            "network.connect_timeout_secs must be <= 600"
         );
         anyhow::ensure!(
             self.network.source_port != Some(0),

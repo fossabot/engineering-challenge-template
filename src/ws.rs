@@ -1,6 +1,9 @@
 //! Small helpers shared by the exchange websocket sessions.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    time::Duration,
+};
 
 use anyhow::{Context, bail};
 use futures_util::{SinkExt, StreamExt, stream::FuturesUnordered};
@@ -34,6 +37,9 @@ pub struct ConnectOptions {
     /// Number of simultaneous handshakes to race. The first success wins and
     /// every other attempt is dropped, closing its socket.
     pub attempts: usize,
+    /// Deadline for the whole attempt: DNS resolution, TCP connect, TLS
+    /// negotiation, and the websocket upgrade, across every raced candidate.
+    pub connect_timeout: Duration,
 }
 
 impl Default for ConnectOptions {
@@ -43,6 +49,7 @@ impl Default for ConnectOptions {
             source_ip: None,
             source_port: None,
             attempts: 1,
+            connect_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -76,9 +83,33 @@ impl ConnectOptions {
 ///
 /// The TCP connection is established explicitly so the collector can apply
 /// `TCP_NODELAY`, bind a source address, and race several full handshakes.
-/// Racing includes TLS and the websocket upgrade, not just the TCP SYN, so a
-/// connection is only selected after it is usable.
+/// Racing covers TLS and the websocket upgrade as well as the TCP handshake,
+/// so a connection is only selected after it is usable.
+///
+/// The entire attempt -- name resolution through the websocket upgrade,
+/// across every raced candidate -- is bounded by
+/// [`ConnectOptions::connect_timeout`]; exceeding it returns an error so the
+/// caller can retry with backoff like any other transient failure.
 pub async fn connect(
+    url: &str,
+    headers: &[(http::HeaderName, http::HeaderValue)],
+    options: &ConnectOptions,
+) -> anyhow::Result<WsStream> {
+    match tokio::time::timeout(
+        options.connect_timeout,
+        connect_inner(url, headers, options),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!(
+            "websocket connection to {url} timed out after {:?}",
+            options.connect_timeout
+        ),
+    }
+}
+
+async fn connect_inner(
     url: &str,
     headers: &[(http::HeaderName, http::HeaderValue)],
     options: &ConnectOptions,
@@ -263,6 +294,81 @@ mod tests {
         assert_eq!(options.attempts, 1);
         assert!(options.source_ip.is_none());
         assert!(options.source_port.is_none());
+        assert!(options.connect_timeout > Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn stalled_handshake_is_bounded_by_the_connect_timeout() {
+        // A server that accepts the TCP connection but never answers the
+        // websocket upgrade must not hang the caller past the deadline.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::AsyncReadExt as _;
+                let mut buffer = [0u8; 1024];
+                let _ = stream.read(&mut buffer).await;
+                std::future::pending::<()>().await;
+            }
+        });
+
+        let options = ConnectOptions {
+            connect_timeout: Duration::from_millis(250),
+            ..ConnectOptions::default()
+        };
+        let started = tokio::time::Instant::now();
+        let error = connect(&format!("ws://{address}"), &[], &options)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("timed out"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deadline must bound the attempt, took {:?}",
+            started.elapsed()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn dropping_a_read_future_loses_no_frame() {
+        // The session supervisor may drop a frame future when another
+        // `select!` branch wins. The read state lives in the stream, so the
+        // dropped poll must not consume or lose either frame.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            ws.send(Message::Text("first".into())).await.unwrap();
+            ws.send(Message::Text("second".into())).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let mut stream = connect(&format!("ws://{address}"), &[], &ConnectOptions::default())
+            .await
+            .unwrap();
+        // Poll once against an immediately-ready branch and drop the read
+        // while it is still waiting for the first frame.
+        tokio::select! {
+            biased;
+            _ = next_payload(&mut stream) => panic!("no frame should be ready yet"),
+            _ = std::future::ready(()) => {}
+        }
+        match next_payload(&mut stream).await.unwrap() {
+            WsPayload::Text(text) => assert_eq!(text, "first"),
+            WsPayload::Idle => panic!("expected a text frame"),
+        }
+        match next_payload(&mut stream).await.unwrap() {
+            WsPayload::Text(text) => assert_eq!(text, "second"),
+            WsPayload::Idle => panic!("expected a text frame"),
+        }
+        server.await.unwrap();
     }
 
     #[test]

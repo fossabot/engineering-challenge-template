@@ -212,9 +212,6 @@ pub async fn run_worker(
         let mut idle_deadline = now + config.idle_timeout;
         let mut next_keepalive = now + config.keepalive_interval;
         let mut next_status = now + config.status_interval;
-        // A completed read may be dropped when another select branch wins. Keep
-        // the frame here so cancellation never loses market data.
-        let mut pending_frame: Option<SessionFrame> = None;
 
         if !desired.is_empty() {
             let reset = ExchangeEvent::StreamReset {
@@ -337,10 +334,11 @@ pub async fn run_worker(
                 .min(idle_deadline);
             let mut pending_control: Option<Control> = None;
             tokio::select! {
-                // Prefer a ready frame. Completed frames are also buffered by
-                // `next_frame_buffered`, so losing this race is safe.
+                // Prefer a ready frame. A dropped poll loses no data: the
+                // read state lives in the session's transport, and a decoded
+                // data frame is returned without further await points.
                 biased;
-                frame = next_frame_buffered(&mut session, &mut pending_frame) => {
+                frame = read_next_frame(&mut session) => {
                     match frame {
                         Ok(frame) => {
                             status.messages = status.messages.saturating_add(1);
@@ -496,27 +494,23 @@ async fn handle_control(
     }
 }
 
-/// Read one frame without losing a completed future when another `select!`
-/// branch wins. The inner read is cancellation-safe at the transport level; if
-/// it completes during a losing poll, the frame is stored in `pending` before
-/// this future returns.
-async fn next_frame_buffered(
+/// Read one frame for the supervisor's `select!`.
+///
+/// Cancellation safety lives in the session contract, not in a buffer here: a
+/// poll dropped while awaiting a read loses no data because the transport
+/// keeps read state inside the session, and a decoded data frame is returned
+/// without further await points. Control-frame handling that does await
+/// (Kalshi's reconcile and rate-limit backoff) is re-driven by its
+/// acknowledgement timeout, which self-heals through a reconnect.
+async fn read_next_frame(
     session: &mut Option<Box<dyn MarketDataSession>>,
-    pending: &mut Option<SessionFrame>,
 ) -> Result<SessionFrame, SessionFailure> {
-    if let Some(frame) = pending.take() {
-        return Ok(frame);
+    match session.as_mut() {
+        Some(active) => active.next_frame().await,
+        None => Err(SessionFailure::Reconnect(anyhow::anyhow!(
+            "missing session"
+        ))),
     }
-    let frame = match session.as_mut() {
-        Some(active) => active.next_frame().await?,
-        None => {
-            return Err(SessionFailure::Reconnect(anyhow::anyhow!(
-                "missing session"
-            )));
-        }
-    };
-    *pending = Some(frame);
-    Ok(pending.take().expect("frame was just stored"))
 }
 
 async fn close_and_stop(
@@ -623,6 +617,7 @@ fn truncate_error(error: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exchange::Exchange as _;
 
     #[test]
     fn truncates_errors_on_utf8_boundaries() {
@@ -630,5 +625,73 @@ mod tests {
         let message = truncate_error(&error);
         assert!(message.ends_with('…'));
         assert!(message.len() <= 512 + '…'.len_utf8());
+    }
+
+    #[tokio::test]
+    async fn stalled_connect_reports_status_and_stops_cleanly() {
+        // A TCP listener that accepts and never upgrades the handshake. The
+        // connect deadline must turn this into a bounded, reported failure
+        // rather than a wedge.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let mut settings = crate::config::Settings::load(None).unwrap();
+        settings.polymarket.ws_url = format!("ws://{address}");
+        settings.network.connect_timeout_secs = 1;
+        let exchange = std::sync::Arc::new(
+            crate::exchange::polymarket::PolymarketExchange::new(
+                settings.polymarket.clone(),
+                settings.network.clone(),
+            )
+            .unwrap(),
+        );
+        let factory = exchange.session_factory();
+
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let (_command_tx, command_rx) = mpsc::channel(8);
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let config = WorkerConfig::from_settings(&settings.collector);
+        let worker = tokio::spawn(run_worker(
+            factory,
+            SourceId::new(0, 0),
+            command_rx,
+            event_tx,
+            config,
+            shutdown_rx,
+        ));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut saw_failure = false;
+        while !saw_failure && tokio::time::Instant::now() < deadline {
+            let event = match tokio::time::timeout_at(deadline, event_rx.recv()).await {
+                Ok(Some(event)) => event,
+                _ => break,
+            };
+            if let WorkerEvent::Status(status) = event
+                && !status.connected
+                && status
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("timed out"))
+            {
+                saw_failure = true;
+            }
+        }
+        assert!(
+            saw_failure,
+            "the stalled handshake must fail within the connect deadline and be reported"
+        );
+
+        // Shutdown still stops the worker promptly, even after a stalled
+        // attempt.
+        let _ = shutdown_tx.send(());
+        let stopped = tokio::time::timeout(Duration::from_secs(10), worker).await;
+        assert!(stopped.is_ok(), "worker did not stop after shutdown");
     }
 }
