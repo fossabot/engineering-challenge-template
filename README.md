@@ -28,7 +28,9 @@ validate the transport, sharding, snapshot, replay, and inspection paths.
 - Handles SIGINT and SIGTERM: stops discovery, emits final snapshots, closes
   websockets, flushes and syncs the SBE file, and writes the sidecars.
 - Exposes dependency-free Prometheus text metrics and `/healthz` when configured.
-- Provides deterministic JSONL replay and an offline SBE inspector.
+- Provides deterministic JSONL replay, an offline SBE inspector, and a `verify`
+  command that proves a capture's deltas reconstruct the snapshots that follow
+  them.
 
 ## Build and test
 
@@ -119,20 +121,35 @@ Polymarket uses Gamma for discovery and the public CLOB market channel for data.
 sizes. There is no exchange sequence number, so protocol faults are recovered by
 reconnecting and resubscribing, which yields fresh books.
 
+Discovery uses Gamma's keyset pagination (`GET /markets/keyset`): every page is
+fetched with `closed=false`, a `limit` of at most 100 records, and the previous
+page's `next_cursor` as `after_cursor`. Offset-style pagination is never used,
+because Gamma rejects deep offsets with HTTP 422, so this is also how the full
+universe is enumerated. Cursor cycles are rejected, repeated cursors fail the
+round, rate-limit responses are retried with `Retry-After`, and records missing
+an explicit `acceptingOrders == true` are excluded under the default strict
+policy (a missing value is unconfirmed, not tradable; set
+`polymarket.require_accepting_orders = false` to keep unknown records while
+retaining the other filters).
+
 ## Commands
 
 ```text
 collect    Live collection (default)
 replay     Replay a normalized JSONL fixture through the same core
 inspect    Decode an aligned SBE capture and print a JSON summary
-latency    Measure discovery RTT and exchange-to-local timestamp latency
+verify     Rebuild each book from deltas and check it against every snapshot
+latency    Measure discovery RTT, exchange-to-local timestamp latency, and
+           cross-connection arrival skew
 discover   Print the current live market set as JSON
 ```
 
 Useful global flags include `--config`, `--output`, `--chunk-size`, `--shards`,
 `--replicas`, `--snapshot-interval-secs`, `--discovery-interval-secs`,
 `--max-markets`, `--duration-secs`, `--metrics-listen`, `--metadata`,
-`--report`, and `--log-json`.
+`--report`, and `--log-json`. Transport flags apply to every websocket
+connection: `--no-tcp-nodelay`, `--source-ip`, `--source-port`, and
+`--connect-race` (see [Latency experiments](#latency-experiments-extension-4)).
 
 Examples:
 
@@ -143,6 +160,10 @@ cargo run --release -- --exchange polymarket --max-markets 10 \
 
 # Inspect a capture; auto-detection is convenient for ad-hoc files
 cargo run --release -- inspect /tmp/poly.sbe --read-chunk-size auto --limit 3
+
+# Verify the capture: rebuild each book from deltas and compare it with the
+# next snapshot; a non-zero exit means the capture is not self-consistent
+cargo run --release -- verify /tmp/poly.sbe
 
 # Replay the checked-in deterministic fixture
 cargo run --release -- --output /tmp/replay.sbe replay fixtures/sample_replay.jsonl
@@ -253,7 +274,7 @@ curl -s http://127.0.0.1:9090/healthz
 Metrics include symbols, snapshots, deltas, rejected deltas, sequence resets,
 source switches, stale probes, writer queue depth, bytes, and per-source status.
 
-## Replay and inspection
+## Replay, inspection, and verification
 
 `fixtures/sample_replay.jsonl` is a deterministic fixture covering discovery,
 two replicas, snapshots, absolute deltas, a source loss and failover, a sequence
@@ -261,34 +282,78 @@ reset and recovery, a lifecycle removal, periodic snapshots, and finalization.
 The complete record schema is documented in
 [docs/replay-format.md](docs/replay-format.md).
 
+`inspect` proves that every message decodes. `verify` goes further: it
+reconstructs each symbol's book from the captured deltas and compares that state
+with the next full snapshot in the file. A mismatch means the capture does not
+describe one complete book history (a lost, duplicated, or out-of-order delta),
+so the command exits non-zero and reports the offending symbols with samples.
+`unknown_messages` (the schema allows template ids this collector never emits)
+and deltas that arrive before their symbol's first snapshot also fail
+verification; the check is deliberately strict because a silently inconsistent
+backtest is worse than a failed capture.
+
+## Latency experiments (Extension 4)
+
+The `latency` command measures, without inventing values:
+
+1. **Discovery RTT** — wall-clock time around one discovery call.
+2. **Exchange-to-local timestamp latency** — `local_receive_us -
+   exchange_timestamp_us` per event, reported as percentiles. This includes
+   exchange/local clock offset and the venue's own timestamp semantics.
+3. **Connection setup** — per-replica `replica_connect_ms` (TCP + TLS +
+   websocket handshake, including any racing) and `replica_first_frame_ms`
+   (subscription to first frame).
+4. **Cross-connection arrival skew** — with `--replicas N`, every replica
+   subscribes to the same symbols and identical events (same symbol, exchange
+   timestamp, exchange clock, and event shape) are matched across connections.
+   Each delta is measured against the earliest arrival, which is
+   clock-independent: it compares when the same update reached two sockets on
+   this host. Per-replica `replica_events` and `replica_first_arrivals` show
+   whether one connection is consistently ahead.
+
+The first two seconds after all subscriptions are established are excluded so
+initial snapshot dumps do not dominate the skew distribution. Events only one
+replica observes are counted as abandoned rather than silently dropped.
+
+Transport experiments are first-class configuration (`[network]` in TOML or the
+matching CLI flags) and apply to `collect` as well as `latency`:
+
+- `tcp_nodelay` (default `true`) sets `TCP_NODELAY` on every websocket socket;
+  the underlying library does not do this for you.
+- `source_ip` / `source_port` bind the local side of every connection before
+  connecting, which is how source-port pinning is measured. The configured port
+  is a base: connection `shard * 256 + replica` binds `base + ordinal`, so
+  parallel connections never collide. A fixed source port cannot be combined
+  with racing.
+- `connect_race` opens that many full TCP + TLS + websocket handshakes
+  concurrently and keeps the first success; the losers are closed. Racing
+  includes the websocket upgrade, not just the TCP SYN.
+
+An authentication rejection (HTTP 401/403) is never raced away: it fails
+immediately so credential errors stay diagnosable.
+
 ## Measured latency
 
-A short public Polymarket run was measured on this machine (macOS, arm64) on
-2026-10-23. The exact command was:
+Four Extension 4 experiments were measured on this machine (macOS, arm64) on
+2026-10-24, each with five Polymarket tokens, two replicas, and a 60-second
+window; the raw reports are checked in under `measurements/`:
 
-```bash
-cargo run --release -- --exchange polymarket --max-markets 3 \
-  --duration-secs 15 latency --out measurements/polymarket-latency-2026-10-23.json
-```
+| Metric | Baseline | `--connect-race 4` | `--source-port 51800` | `--no-tcp-nodelay` |
+|---|---:|---:|---:|---:|
+| Connect (per replica) | 1487 / 1007 ms | 636 / 759 ms | 3167 / 5313 ms | 1164 / 1432 ms |
+| Matched cross-connection events | 176 | 216 | 354 | 396 |
+| Arrival skew p50 | 65 µs | 59 µs | 67,845 µs | 10,543 µs |
+| Arrival skew p95 | 27,004 µs | 5,496 µs | 74,093 µs | 15,280 µs |
 
-Measured result from that one run:
-
-| Metric | Value |
-|---|---:|
-| Discovery RTT | 1,725.944 ms |
-| Frames | 17 |
-| Timestamped events | 33 |
-| p50 latency | 242,669 µs |
-| p95 latency | 4,511,709 µs |
-| p99 latency | 4,511,709 µs |
-| mean latency | 615,049 µs |
-| min / max | 183,544 / 4,511,709 µs |
-
-These are measurements, not benchmarks or guarantees. Timestamp latency is
-`local_receive_us - exchange_timestamp_us` and includes exchange/local clock
-offset and the semantics of the exchange's event timestamp. Polymarket's initial
-`book` snapshots can carry timestamps older than the local receive time, which
-inflates the tail. The methodology and caveats are in
+These are measurements, not benchmarks or guarantees. The cross-connection
+arrival skew is the clock-independent number: two sockets on this host usually
+saw the same update within tens of microseconds, racing four full handshakes
+selected a faster connection in these runs, source-port pinning was the *worst*
+configuration measured (the venue's CDN can hash the source port onto a worse
+origin path), and disabling `TCP_NODELAY` moved the skew p50 from 65 µs to
+10.5 ms. Timestamp latency (`local_receive_us - exchange_timestamp_us`)
+remains dominated by exchange/local clock offset and venue timestamp semantics.
+The methodology, all caveats, and the full findings are in
 [docs/latency.md](docs/latency.md).
 
 A 20-second public smoke capture with 4 symbols and 2 replicas produced 58 SBE
@@ -318,6 +383,12 @@ settings:
 | `collector.final_snapshots` | true | Final snapshots on shutdown |
 | `collector.writer_queue` | 16384 | Bounded writer queue |
 | `collector.flush_interval_secs` | 1 | Output-visibility bound: every interval with traffic ends with an unpadded flush, so a downstream reader sees an accepted delta within about one second |
+| `network.tcp_nodelay` | true | `TCP_NODELAY` on every websocket socket |
+| `network.source_ip` | none | Local IP to bind before connecting |
+| `network.source_port` | none | Base local source port; connection `shard*256+replica` binds `base + ordinal`; not combinable with `connect_race > 1` |
+| `network.connect_race` | 1 | Simultaneous full handshakes; the first success is kept |
+| `polymarket.discovery_page_size` | 100 | Gamma keyset page size; the endpoint accepts at most 100 |
+| `polymarket.require_accepting_orders` | true | Only an explicit `acceptingOrders == true` is tradable |
 | `output.chunk_size` | 67108864 | Power-of-two chunk; defaults to 64 MiB for template-reader compatibility. Padding is written only on chunk rotation and at close |
 | `output.path` | `-` | File or binary stdout |
 
@@ -330,13 +401,15 @@ src/
   coordinator.rs      live orchestration, discovery, signals, reports
   collector/state.rs  deterministic core, sharding, shadow books, failover
   exchange/kalshi/    auth, discovery, codec, websocket session
-  exchange/polymarket/ Gamma discovery, CLOB codec, websocket session
+  exchange/polymarket/ Gamma keyset discovery, CLOB codec, websocket session
   session.rs          generic source supervisor
   writer.rs           single serialized SBE writer
   replay.rs           normalized JSONL replay
   inspect.rs          aligned SBE inspection
-  latency.rs          measured discovery/timestamp latency
+  verify.rs           capture self-consistency verification
+  latency.rs          measured latency, connection setup, and cross-replica skew
   report.rs           atomic run-report and metadata sidecars
+  ws.rs               websocket transport: TCP_NODELAY, source binding, racing
   util/               supplied aligned SBE helpers and generated DTOs
 fixtures/             deterministic replay fixture
 docs/                 replay format and latency methodology
@@ -354,11 +427,14 @@ measurements/         exact measured reports from public runs
   simulated validation.
 - Polymarket is a public, best-effort feed with no sequence numbers. Recovery is
   reconnect-and-resubscribe. Its event timestamps are not a send-time clock.
-- `inspect --read-chunk-size auto` may select a smaller power-of-two chunk that
-  also validates the file. Pass the writer's exact `--chunk-size` when the exact
-  chunk size matters.
-- The latency table is one short public-feed observation, not a controlled
-  benchmark across networks or colocated hosts.
+- `inspect --read-chunk-size auto` streams candidate chunks from disk instead of
+  reading the whole file into memory, and never considers a chunk larger than
+  256 MiB; captures written with a larger chunk need an explicit
+  `--read-chunk-size`. Auto-detection may select a smaller power-of-two chunk
+  that also validates the file, so pass the writer's exact `--chunk-size` when
+  the exact chunk size matters.
+- The latency tables are short public-feed observations, not controlled
+  benchmarks across networks or colocated hosts.
 
 ## License
 

@@ -1,11 +1,12 @@
-# Latency experiment
+# Latency experiment (Extension 4)
 
 ## What is measured
 
-The `latency` command measures two different things and never invents values:
+The `latency` command measures four different things and never invents values:
 
 1. **Discovery RTT**: wall-clock time around one `Exchange::discover_markets`
-   call. This includes HTTP connection setup, pagination, and JSON decoding.
+   call. This includes HTTP connection setup, keyset pagination, and JSON
+   decoding.
 2. **Exchange-to-local timestamp latency**: for each decoded snapshot, delta, or
    lifecycle event that has an exchange timestamp:
 
@@ -17,48 +18,135 @@ The `latency` command measures two different things and never invents values:
    read and before decoding. The result includes any exchange/local clock offset
    and whatever timestamp semantics the exchange uses.
 
-Negative values are counted separately and excluded from percentiles. If no
-timestamped events arrive, all latency fields are `null`.
+3. **Connection setup**: `replica_connect_ms` is the wall-clock time of one
+   session's `connect()` — TCP, TLS, and the websocket upgrade, including any
+   racing — and `replica_first_frame_ms` is the time from the replica task
+   starting (immediately after connect and subscribe) to its first frame.
+4. **Cross-connection arrival skew**: with `--replicas N`, every replica
+   subscribes to the same symbols on its own connection. Identical events — the
+   same symbol, exchange timestamp, exchange clock, and event shape (side,
+   price, and quantity for a level change) — are matched across connections, and
+   each reported delta is the later arrival minus the earliest arrival of that
+   event. This comparison is **clock-independent**: it never subtracts an
+   exchange timestamp from a local one, so exchange/local clock offset cannot
+   distort it. `replica_first_arrivals` counts which connection saw each matched
+   event first.
 
+Negative timestamp-latency values are counted separately and excluded from
+percentiles. If no timestamped events arrive, all latency fields are `null`.
 Percentiles use nearest-rank selection on the collected samples, with no
 interpolation or extrapolation.
 
-## Command
+With more than one replica, the first two seconds after every subscription is
+established are excluded from the measurement window, because the initial
+snapshot dump arrives at a different time on each connection and would otherwise
+dominate the skew distribution with setup artefacts. Events that only one
+replica ever observes are counted in `replica_abandoned_events` rather than
+being silently dropped. A one-replica run reports no skew samples at all.
 
-Measured on 2026-10-23 on macOS 27.0.1 (arm64), using the release build:
+## Commands
+
+All runs below were measured on 2026-10-24 on macOS 27.0.1 (arm64) over the
+public internet, using the release build, Polymarket's public feed, five
+outcome tokens, two replicas, and a 60-second window:
 
 ```bash
-cargo run --release -- --exchange polymarket --max-markets 3 \
-  --duration-secs 15 latency \
-  --out measurements/polymarket-latency-2026-10-23.json
+cargo run --release -- --exchange polymarket --max-markets 5 --duration-secs 60 \
+  --replicas 2 latency --out measurements/polymarket-latency-baseline-2026-10-24.json
+
+cargo run --release -- --exchange polymarket --max-markets 5 --duration-secs 60 \
+  --replicas 2 --connect-race 4 latency \
+  --out measurements/polymarket-latency-race4-2026-10-24.json
+
+cargo run --release -- --exchange polymarket --max-markets 5 --duration-secs 60 \
+  --replicas 2 --source-port 51800 latency \
+  --out measurements/polymarket-latency-portpin-2026-10-24.json
+
+cargo run --release -- --exchange polymarket --max-markets 5 --duration-secs 60 \
+  --replicas 2 --no-tcp-nodelay latency \
+  --out measurements/polymarket-latency-nodelay-off-2026-10-24.json
 ```
 
-The raw output is checked in at
-[`measurements/polymarket-latency-2026-10-23.json`](../measurements/polymarket-latency-2026-10-23.json).
-The measurement timestamp in that file is `2026-10-23T04:38:29Z`.
+The pinned-port run derives ports 51800 and 51801 for the two connections
+(`base + shard * 256 + replica`). The raw outputs are checked in under
+`measurements/`. The 2026-10-23 single-connection observation
+(`measurements/polymarket-latency-2026-10-23.json`) predates cross-connection
+skew and is retained as history.
 
-## Result of that run
+## Results of those four runs
 
-| Metric | Measured value |
-|---|---:|
-| Discovery RTT | 1,725.944375 ms |
-| Discovered markets (outcome tokens) | 3 |
-| Subscribed markets | 3 |
-| Duration | 15 s |
-| Frames | 17 |
-| Timestamped events | 33 |
-| Bytes received | 26,880 |
-| Latency samples | 33 |
-| Negative samples | 0 |
-| p50 | 242,669 µs |
-| p95 | 4,511,709 µs |
-| p99 | 4,511,709 µs |
-| Mean | 615,049 µs |
-| Min | 183,544 µs |
-| Max | 4,511,709 µs |
+| Metric | Baseline | `--connect-race 4` | `--source-port 51800` | `--no-tcp-nodelay` |
+|---|---:|---:|---:|---:|
+| `tcp_nodelay` | on | on | on | off |
+| `replica_connect_ms` | 1487 / 1007 | 636 / 759 | 3167 / 5313 | 1164 / 1432 |
+| `replica_first_frame_ms` | 2.8 / 434 | 2.9 / 271 | 2.7 / 272 | 2.8 / 617 |
+| Measured events | 352 | 440 | 714 | 792 |
+| Matched cross-connection events | 176 | 216 | 354 | 396 |
+| Abandoned events | 0 | 4 | 6 | 0 |
+| Skew p50 | 65 µs | 59 µs | 67,845 µs | 10,543 µs |
+| Skew p95 | 27,004 µs | 5,496 µs | 74,093 µs | 15,280 µs |
+| Skew max | 43,984 µs | 12,586 µs | 188,859 µs | 429,821 µs |
+| First arrivals (replica 0 / 1) | 36 / 140 | 196 / 20 | 8 / 346 | 36 / 360 |
+| Timestamp-latency p50 | 229,524 µs | 147,670 µs | 192,387 µs | 179,050 µs |
 
-This is one short public-feed observation. It is not a benchmark, a guarantee,
-or a comparison against colocated infrastructure.
+These are four single 60-second observations, not a controlled benchmark. The
+four runs happened at different minutes of the same day on the same network, so
+network conditions varied between them. The findings below are what the data
+supports, no more.
+
+## Findings
+
+1. **Two independent connections usually see the same update within tens of
+   microseconds.** With `TCP_NODELAY` on and ephemeral ports, the matched-event
+   skew p50 was 65 µs (baseline) and 59 µs (racing). The tail is another matter:
+   p95 reached 27 ms in the baseline run. Redundant connections therefore
+   deliver most events near-simultaneously while the tail is dominated by
+   occasional slow paths — exactly the distribution Extension 1's failover
+   design assumes.
+2. **Racing four full handshakes looked strictly better in these runs.** The
+   winning-of-four connect completed in 636/759 ms versus 1487/1007 ms without
+   racing, and the skew tail tightened (p95 5.5 ms versus 27 ms). Racing
+   includes the TLS and websocket upgrade, so the winner is the first
+   *usable* connection, not merely the first TCP SYN. One pair of runs is weak
+   evidence, but the direction is plausible: an anycast/CDN edge can route
+   otherwise-identical handshakes onto different origin paths, and selecting
+   the first success discards the slow ones.
+3. **Source-port pinning was the worst configuration measured.** Pinning ports
+   51800/51801 produced the slowest connects (3.2 s / 5.3 s), the worst skew
+   (p50 67.8 ms), and a lopsided arrival race (replica 1 first on 346 of 354
+   matched events). A plausible cause is that the venue's CDN hashes the source
+   port when choosing an origin path, so a pinned pair can land on a
+   consistently worse path than two ephemeral ports. The honest conclusion is
+   the inverse of the folklore: **pinning source ports is not a free win; it
+   can pin you to a bad path**. Measure before adopting it, and prefer racing
+   or ephemeral ports on venues fronted by a CDN.
+4. **Disabling `TCP_NODELAY` visibly hurt cross-connection arrival.** The
+   no-NODELAY run's skew p50 was 10.5 ms versus 65 µs for the equivalent
+   NODELAY-on baseline, and its worst matched event arrived 430 ms late. This
+   is the Nagle/delayed-ACK interaction the brief's advice predicts: small
+   order-book frames must not wait for coalescing. `TCP_NODELAY` stays the
+   default.
+5. **The venue's initial dump treats the second identical subscription
+   differently.** Replica 0's first frame consistently arrived ~3 ms after its
+   task started, while replica 1 — subscribed to exactly the same assets a
+   fraction of a second later — waited 271–617 ms for its first frame on every
+   run. Whatever the cause (server-side subscription batching or deduplication
+   of identical subscriptions), it means the first *measured* frames are not
+   representative of steady state, which is why the two-second settle window
+   exists.
+6. **The venue edge intermittently rejects handshakes with HTTP 525.** Two of
+   the eight first-attempt latency connects in this session were rejected with
+   Cloudflare's "SSL handshake failed" status before any subscription was sent.
+   The live collector already retries with backoff; the `latency` command now
+   applies the same bounded three-attempt retry, and never retries a fatal
+   (authentication) rejection. A retried handshake cannot bias any reported
+   value because the measurement window starts only after every session is
+   connected.
+7. **Timestamp latency remains dominated by clock offset and venue semantics.**
+   The `local_receive_us - exchange_timestamp_us` p50 across runs was
+   148–230 ms with a p99 up to 511 ms. This includes exchange/local clock
+   offset and Polymarket's event-timestamp semantics, so it is not a network
+   latency measurement; the cross-connection skew is the number to read.
 
 ## Interpretation and caveats
 
@@ -67,9 +155,11 @@ or a comparison against colocated infrastructure.
 - Polymarket's `timestamp` is an exchange event timestamp, not a guaranteed
   send-time clock. A nonzero clock offset between the exchange and this host is
   included in every sample.
-- The run uses the public internet from a laptop, not a colocated host.
-- Discovery RTT includes Gamma pagination and JSON decoding; it is not a
-  websocket handshake measurement.
+- All runs used the public internet from a laptop, not a colocated host, and
+  each configuration was measured once.
+- Discovery RTT (0.7–5.0 s across these runs, and ~9m52s for the full
+  2,746-page universe sweep) includes Gamma pagination and JSON decoding; it is
+  not a websocket handshake measurement.
 - No Kalshi latency result is recorded here because live Kalshi order-book
   subscriptions require credentials that were not supplied. The same command
   works once `KALSHI_API_KEY_ID` and a private key are configured, and it should
@@ -77,6 +167,7 @@ or a comparison against colocated infrastructure.
 
 ## Reproducing
 
-The command writes the JSON report to `--out` and prints the same JSON to stdout.
-Run it several times if you need a distribution across network conditions; do
-not average separate runs unless you label that aggregate explicitly.
+The command writes the JSON report to `--out` and prints the same JSON to
+stdout. Run each configuration several times if you need a distribution across
+network conditions; do not average separate runs unless you label that
+aggregate explicitly.

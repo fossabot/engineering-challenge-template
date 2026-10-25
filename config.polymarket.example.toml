@@ -5,9 +5,12 @@ exchange = "polymarket"
 gamma_url = "https://gamma-api.polymarket.com"
 ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 batch_size = 500
-discovery_page_size = 500
+# Gamma's keyset endpoint accepts at most 100 records per page.
+discovery_page_size = 100
 request_timeout_secs = 20
 discovery_page_delay_ms = 50
+# Strict policy: only an explicit acceptingOrders == true is tradable. A
+# missing field is unconfirmed and excluded while this is enabled.
 require_accepting_orders = true
 
 [collector]
@@ -28,6 +31,12 @@ flush_interval_secs = 1
 max_markets = 20
 duration_secs = 0
 writer_send_timeout_secs = 30
+
+[network]
+tcp_nodelay = true
+# source_ip = "192.0.2.10"
+# source_port = 40000
+connect_race = 1
 
 [output]
 path = "captures/polymarket.sbe"

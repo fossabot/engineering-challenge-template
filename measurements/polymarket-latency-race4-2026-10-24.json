@@ -1,0 +1,64 @@
+{
+  "exchange": "polymarket",
+  "environment": "public",
+  "measured_at_us": 1792823243393802,
+  "discovery_rtt_ms": 1504.7811669999999,
+  "discovered_markets": 5,
+  "subscribed_markets": 5,
+  "duration_secs": 60,
+  "settle_secs": 2,
+  "replicas": 2,
+  "tcp_nodelay": true,
+  "source_ip": null,
+  "source_port": null,
+  "connect_race": 4,
+  "frames": 232,
+  "events": 440,
+  "bytes": 136924,
+  "replica_connect_ms": [
+    635.547,
+    759.159875
+  ],
+  "replica_first_frame_ms": [
+    2.885042,
+    271.401458
+  ],
+  "latency_samples": 440,
+  "negative_latency_samples": 0,
+  "latency_p50_us": 147670,
+  "latency_p95_us": 234440,
+  "latency_p99_us": 328022,
+  "latency_min_us": 120257,
+  "latency_max_us": 333007,
+  "latency_mean_us": 165407,
+  "replica_events": [
+    220,
+    220
+  ],
+  "replica_first_arrivals": [
+    196,
+    20
+  ],
+  "replica_matched_events": 216,
+  "replica_abandoned_events": 4,
+  "replica_skew_samples": 216,
+  "replica_skew_p50_us": 59,
+  "replica_skew_p95_us": 5496,
+  "replica_skew_p99_us": 7481,
+  "replica_skew_min_us": 0,
+  "replica_skew_max_us": 12586,
+  "replica_skew_mean_us": 1442,
+  "error": null,
+  "errors": [],
+  "notes": [
+    "discovery_rtt_ms is a local wall-clock measurement around one discovery call",
+    "latency is local_receive_us - exchange_timestamp_us and includes exchange/local clock offset",
+    "negative values are counted separately and excluded from percentiles",
+    "no latency value is reported when no timestamped events arrived",
+    "replica_connect_ms and replica_first_frame_ms are local wall-clock measurements of session setup and subscription-to-first-frame latency",
+    "replica skew compares the same symbol, exchange timestamp, clock and event shape across 2 connection(s); each delta is relative to the earliest arrival",
+    "the first 2 second(s) after all subscriptions are established are excluded so initial snapshots do not dominate the skew distribution",
+    "identical duplicate events at the same exchange timestamp and shape can be coalesced; unmatched events are counted as abandoned",
+    "a one-replica run reports no skew samples; skew requires at least two independent connections"
+  ]
+}

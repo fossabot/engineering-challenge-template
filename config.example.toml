@@ -34,6 +34,18 @@ max_markets = 0
 duration_secs = 0
 writer_send_timeout_secs = 30
 
+[network]
+# Transport controls for every websocket connection. TCP_NODELAY is enabled by
+# default because order-book frames are small and latency-sensitive. Race
+# several full handshakes with connect_race > 1 and keep the first success.
+# source_port is a base: connection shard*256+replica binds base + that
+# ordinal, so parallel connections never collide; a fixed port cannot be
+# combined with racing.
+tcp_nodelay = true
+# source_ip = "192.0.2.10"
+# source_port = 40000
+connect_race = 1
+
 [output]
 path = "captures/kalshi.sbe"
 # Matches the template reader's default. Periodic flushes write only encoded
