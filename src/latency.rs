@@ -1,10 +1,10 @@
 //! Measured discovery and websocket timestamp-latency experiment.
 //!
-//! The command never invents numbers: if no frames arrive, percentiles are
-//! absent. Exchange timestamps are compared with the local receive clock, so
-//! the result includes any exchange/local clock offset. When more than one
-//! replica is configured, identical events are matched across connections and
-//! their arrival skew is reported separately. The methodology is documented in
+//! If no timestamped frames arrive, percentiles are absent. Exchange
+//! timestamps are compared with the local receive clock, so the result
+//! includes any exchange/local clock offset. When more than one replica is
+//! configured, identical events are matched across connections and their
+//! arrival skew is reported separately. The methodology is documented in
 //! `docs/latency.md`.
 
 use std::{
@@ -182,7 +182,7 @@ pub async fn run(
     let mut errors: Vec<String> = Vec::new();
     let mut skew = SkewTracker::new(replica_count);
     let settle_secs = if replica_count > 1 { SETTLE_SECS } else { 0 };
-    // The settle window deliberately discards startup frames, but the
+    // The settle window discards startup frames, but the
     // first-frame timing is setup evidence and must survive it.
     discard_startup_frames(&mut frame_rx, settle_secs, &mut first_frames).await;
     let measurement_started_us =

@@ -1,4 +1,4 @@
-//! Command-line surface. The binary is intentionally thin: every command
+//! Command-line surface. The binary is thin: every command
 //! delegates to a library module with explicit inputs and outputs.
 
 use std::{net::SocketAddr, path::PathBuf};

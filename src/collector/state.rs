@@ -1518,10 +1518,8 @@ mod tests {
         core.drain_controls();
 
         // Source A processes B's older frame after A's newer frame. The core
-        // preserves processing order and each frame's actual receive time.
-        // Global chronological order is intentionally not a contract; this
-        // guards against a writer-level timestamp clamp that would hide the
-        // regression by rewriting evidence.
+        // preserves processing order and each frame's actual receive time;
+        // global chronological order is not a contract.
         let first = core.handle_event(
             SOURCE_A,
             snapshot_event_at("A", 400_000, 600_000, 10, NOW + 20),

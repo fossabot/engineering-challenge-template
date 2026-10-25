@@ -1,6 +1,6 @@
 //! Opt-in public Polymarket integration test.
 //!
-//! This is intentionally ignored by default so offline CI never depends on a
+//! This is ignored by default so offline CI never depends on a
 //! third-party network. Run it explicitly with:
 //! `RUN_LIVE_TESTS=1 cargo test --test live_polymarket -- --ignored --nocapture`
 

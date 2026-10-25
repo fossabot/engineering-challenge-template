@@ -1,6 +1,6 @@
 //! Lightweight Prometheus endpoint and shared counters.
 //!
-//! The collector deliberately avoids a metrics framework here: one lock-protected
+//! The collector avoids a metrics framework here: one lock-protected
 //! snapshot is updated once per second, and the HTTP handler formats it on
 //! demand. No data-path counter is ever blocked on the network.
 

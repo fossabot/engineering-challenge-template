@@ -33,7 +33,7 @@ struct RawMarket {
     question: Option<String>,
     #[serde(default)]
     title: Option<String>,
-    // `slug` is intentionally not modeled: it is mutable presentation
+    // `slug` is not modeled: it is mutable presentation
     // metadata and must never influence the output symbol.
     #[serde(default)]
     active: Option<bool>,

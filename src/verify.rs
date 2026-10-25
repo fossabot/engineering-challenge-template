@@ -4,7 +4,7 @@
 //! reconstructs each symbol's book from the captured deltas and compares that
 //! state with the next full snapshot. A mismatch means the capture does not
 //! describe a single, complete book history: a delta was lost, duplicated, or
-//! applied out of order. The check is deliberately strict because a silently
+//! applied out of order. The check is strict because a silently
 //! inconsistent backtest is worse than a failed capture.
 
 use std::{
@@ -114,9 +114,9 @@ pub fn run(input: &Path, chunk_size: &str) -> anyhow::Result<VerifySummary> {
                 // boundary. It carries no level evidence, so comparing it with
                 // the book rebuilt from earlier deltas would flag every normal
                 // discovery removal and identity change. Count it and use it as
-                // the new anchor instead. This deliberately cannot prove that a
-                // suppressed update which emptied a book was observed; only a
-                // later non-empty snapshot can provide that evidence.
+                // the new anchor instead. An empty snapshot cannot prove that a
+                // suppressed update emptied a book; only a later non-empty
+                // snapshot can expose that gap.
                 if !empty
                     && let Some(current) = books.get(&snapshot.symbol)
                     && snapshots_seen.contains(&snapshot.symbol)

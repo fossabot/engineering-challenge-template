@@ -1,6 +1,6 @@
 //! Deterministic replay of normalized JSONL fixtures.
 //!
-//! The replay path deliberately feeds the same synchronous [`CollectorCore`] as
+//! The replay path feeds the same synchronous [`CollectorCore`] as
 //! the live coordinator. A fixture is one JSON object per line; each record has
 //! a local `received_at_us` timestamp so snapshot scheduling and source failover
 //! are reproducible without sleeping. See `docs/replay-format.md` for the

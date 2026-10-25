@@ -1,10 +1,10 @@
 //! Kalshi market discovery.
 //!
-//! Kalshi's `/markets` endpoint is paginated by an opaque cursor. We request
-//! open markets while asking the server to exclude multivariate events, then
-//! apply the same filter locally as a defensive check. Discovery is deliberately
-//! independent of websocket subscriptions so a transient REST failure never
-//! tears down live books.
+//! Kalshi's `/markets` endpoint is paginated by an opaque cursor. Discovery
+//! requests open markets with the server-side multivariate-event exclusion
+//! and repeats the same filter locally. Discovery is independent of
+//! websocket subscriptions so a transient REST failure never tears down
+//! live books.
 
 use std::collections::BTreeSet;
 
@@ -28,7 +28,7 @@ use crate::{
 /// single bad entry cannot abort reconciliation for every valid market. If
 /// every record on a non-empty page fails, the response is untrustworthy and
 /// an error is returned so the round is retried instead of silently
-/// reconciling a partial set. Records filtered out by design (MVE, inactive)
+/// reconciling a partial set. Records removed by the active/MVE filters
 /// are not failures.
 fn convert_kalshi_page(
     page: Vec<RawMarket>,
@@ -47,7 +47,7 @@ fn convert_kalshi_page(
                     break;
                 }
             }
-            // Filtered by design (MVE, inactive): processed, not a failure.
+            // Removed by the active/MVE filters: processed, not a failure.
             Ok(None) => processed += 1,
             Err(error) => {
                 page_skipped += 1;

@@ -189,7 +189,7 @@ fn decode_object(
             lifecycle_for_assets(object, LifecycleKind::NewMarket, title, meta)
         }
         "market_resolved" => lifecycle_for_assets(object, LifecycleKind::Resolved, None, meta),
-        // Documented, deliberately ignored event types. They carry no
+        // Documented event types ignored by the collector. They carry no
         // order-book state for this collector.
         "best_bid_ask" | "last_trade_price" | "tick_size" => Ok(Vec::new()),
         // Unknown types are counted and logged (once per name) instead of
@@ -291,7 +291,7 @@ fn scalar_string(value: &Value) -> anyhow::Result<String> {
 /// Parse the documented `timestamp` field, which the market channel types as
 /// `string | null` and may omit entirely.
 ///
-/// Three outcomes are distinct by design:
+/// The three outcomes are distinct:
 /// - field absent or JSON `null` → `Ok(None)`; the venue contract permits
 ///   both, and callers fall back to the local receive time;
 /// - a present, well-formed value → `Ok(Some(micros))`;

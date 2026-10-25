@@ -700,12 +700,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn shutdown_drains_saturated_queue_and_joins() {
-        // A FIFO whose reader deliberately stalls blocks the worker's writes
-        // once the pipe buffer fills, which saturates the bounded queue. The
-        // old implementation returned an error immediately and dropped the
-        // worker without joining; the contract now is: close admission, let
-        // the reader drain, join the worker, and confirm every accepted
-        // message was written.
+        // A FIFO whose reader stalls blocks the worker's writes once the
+        // pipe buffer fills, which saturates the bounded queue. Shutdown
+        // must close admission, let the reader drain, join the worker, and
+        // confirm every accepted message was written.
         let dir = tempfile::tempdir().unwrap();
         let fifo = dir.path().join("blocked.sbe");
         let status = std::process::Command::new("mkfifo")

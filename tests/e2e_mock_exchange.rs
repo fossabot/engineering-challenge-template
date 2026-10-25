@@ -1,10 +1,9 @@
 //! End-to-end tests against an independent mock exchange.
 //!
-//! These tests drive the real `coordinator::run_with_shutdown`, the real
-//! Polymarket discovery/session adapters, the real collector core, the real
-//! serialized SBE writer, and the real SBE reader. The mock exchange owns an
-//! independent authoritative book and event history; it is deliberately not a
-//! second implementation of the collector state machine.
+//! These tests drive `coordinator::run_with_shutdown` with the real Polymarket
+//! discovery/session adapters, collector core, serialized SBE writer, and SBE
+//! reader. The mock exchange owns an independent authoritative book and event
+//! history.
 //!
 //! `verify` is only a capture self-consistency check. The oracle for capture
 //! completeness under these scenarios is the mock exchange's full delivered
@@ -1298,7 +1297,7 @@ async fn full_outage_recovery_exposes_the_uncovered_interval() {
     sleep(Duration::from_millis(200)).await;
 
     // These updates occur during the uncovered interval. They change the
-    // authoritative book but are deliberately not delivered.
+    // authoritative book but are not delivered.
     assert!(!mock.publish_delta("asset-a", Side::Buy, 400_000, 20_000_000));
     assert!(!mock.publish_delta("asset-a", Side::Sell, 600_000, 1_000_000));
     let truth_after_outage = mock.book("asset-a");

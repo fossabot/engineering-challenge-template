@@ -34,9 +34,9 @@ impl std::fmt::Display for ExchangeKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum KalshiEnvironment {
-    /// Live exchange. The collector is read-only; this is the default because
-    /// the challenge targets live markets and a grader's production
-    /// credentials would receive 401 against the demo host.
+    /// Live exchange. The collector is read-only, and the default targets
+    /// live markets; production credentials do not authenticate against
+    /// the demo host.
     #[default]
     Production,
     /// Simulated exchange with demo credentials.

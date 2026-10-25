@@ -1,6 +1,6 @@
 //! Kalshi websocket payload decoding.
 //!
-//! The decoder is intentionally independent of the transport and of the
+//! The decoder is independent of the transport and of the
 //! collector core. It turns one JSON text frame into either a normalized event
 //! or a control acknowledgement that the session must process. Keeping this
 //! layer pure makes the wire contract easy to test and audit.

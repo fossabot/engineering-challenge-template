@@ -26,7 +26,8 @@ pub const HEADER_KEY: HeaderName = HeaderName::from_static("kalshi-access-key");
 pub const HEADER_SIGNATURE: HeaderName = HeaderName::from_static("kalshi-access-signature");
 pub const HEADER_TIMESTAMP: HeaderName = HeaderName::from_static("kalshi-access-timestamp");
 
-/// Private signing material. Deliberately not `Debug`; never log key bytes.
+/// Private signing material. `Debug` is not implemented so key bytes are
+/// never logged.
 enum KeyMaterial {
     Ed25519(Box<SigningKey>),
     Rsa(Box<RsaPssSigningKey<Sha256>>),

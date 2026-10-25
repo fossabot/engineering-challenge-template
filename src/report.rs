@@ -1,6 +1,6 @@
 //! Run reports and market-metadata sidecars.
 //!
-//! These files are deliberately independent of the SBE stream: operators can
+//! These files are independent of the SBE stream: operators can
 //! inspect what was collected, how the process ended, and which native exchange
 //! identifiers correspond to each SBE symbol without decoding the binary file.
 
