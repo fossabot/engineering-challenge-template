@@ -248,20 +248,23 @@ impl WriterHandle {
 
     /// Send one message, waiting for queue capacity. A timeout prevents a
     /// wedged writer from deadlocking the whole collector forever.
+    ///
+    /// Capacity is reserved before the message is handed over, so a timed-out
+    /// send cannot have enqueued the message and cannot leave the queue-depth
+    /// counter off by one.
     pub async fn send(&self, message: OutputMessage, timeout: Duration) -> anyhow::Result<()> {
-        self.counters.queue_depth.fetch_add(1, Ordering::Relaxed);
-        let send = self.sender.send(WriterCommand::Message(message));
-        match tokio::time::timeout(timeout, send).await {
-            Ok(Ok(())) => Ok(()),
+        let permit = match tokio::time::timeout(timeout, self.sender.reserve()).await {
+            Ok(Ok(permit)) => permit,
             Ok(Err(_)) => {
-                self.counters.queue_depth.fetch_sub(1, Ordering::Relaxed);
-                anyhow::bail!("SBE writer stopped: {}", self.fatal_message())
+                anyhow::bail!("SBE writer stopped: {}", self.fatal_message());
             }
             Err(_) => {
-                self.counters.queue_depth.fetch_sub(1, Ordering::Relaxed);
-                anyhow::bail!("SBE writer queue full for {timeout:?}")
+                anyhow::bail!("SBE writer queue full for {timeout:?}");
             }
-        }
+        };
+        self.counters.queue_depth.fetch_add(1, Ordering::Relaxed);
+        permit.send(WriterCommand::Message(message));
+        Ok(())
     }
 
     /// Flush currently encoded bytes without padding. The final chunk is
@@ -538,6 +541,8 @@ mod tests {
         fail_flush: bool,
         fail_finish: bool,
         fail_sync: bool,
+        /// Delay injected before every write, used to saturate the queue.
+        stall_write: Option<Duration>,
         writes: usize,
     }
 
@@ -548,6 +553,7 @@ mod tests {
                 fail_flush: false,
                 fail_finish: false,
                 fail_sync: false,
+                stall_write: None,
                 writes: 0,
             }
         }
@@ -555,6 +561,9 @@ mod tests {
 
     impl MessageSink for FaultySink {
         fn write(&mut self, _message: &OutputMessage) -> anyhow::Result<()> {
+            if let Some(stall) = self.stall_write {
+                std::thread::sleep(stall);
+            }
             self.writes += 1;
             if Some(self.writes) == self.fail_write_at {
                 anyhow::bail!("injected write failure");
@@ -756,6 +765,50 @@ mod tests {
             read_bytes >= accepted,
             "reader saw {read_bytes} bytes for {accepted} messages"
         );
+    }
+
+    #[tokio::test]
+    async fn saturated_send_times_out_without_queue_side_effects() {
+        let writer = WriterHandle::start_with_sink(
+            Box::new(FaultySink {
+                stall_write: Some(Duration::from_millis(500)),
+                ..FaultySink::healthy()
+            }),
+            2,
+            false,
+            "unused",
+        )
+        .unwrap();
+        // The worker picks up the first message and stalls inside its write,
+        // so the two remaining slots can be filled deterministically.
+        writer.send(update("sym-a"), TINY_TIMEOUT).await.unwrap();
+        for _ in 0..200 {
+            if writer.stats().queue_depth == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            writer.stats().queue_depth,
+            0,
+            "worker did not pick up the first message"
+        );
+        writer.send(update("sym-b"), TINY_TIMEOUT).await.unwrap();
+        writer.send(update("sym-c"), TINY_TIMEOUT).await.unwrap();
+        let error = writer
+            .send(update("sym-d"), Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("queue full"),
+            "unexpected error: {error:#}"
+        );
+        // The timed-out send never entered the queue: exactly the three
+        // accepted messages are written, and the depth returns to zero.
+        let stats = writer.shutdown_with_stats(PATIENT_TIMEOUT).await.unwrap();
+        assert_eq!(stats.messages, 3);
+        assert_eq!(stats.queue_depth, 0);
+        assert_eq!(stats.errors, 0);
     }
 
     #[tokio::test]
