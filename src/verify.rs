@@ -356,6 +356,19 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_capture_validates_with_zero_messages() {
+        // A capture that contains only the format's end sentinel is
+        // self-consistent. Validity alone is not completeness: the sentinel
+        // defines the stream's end, so the message count must be compared
+        // with the run report's `writer.messages` to expose truncation.
+        let (_directory, path) = write_capture(Vec::new());
+        let summary = run(&path, "4096").unwrap();
+        assert!(summary.valid);
+        assert_eq!(summary.messages, 0);
+        assert_eq!(summary.symbols, 0);
+    }
+
+    #[test]
     fn reports_a_delta_before_any_snapshot() {
         let (_directory, path) = write_capture(vec![
             update(1, Side::Buy, 400_000, 15),

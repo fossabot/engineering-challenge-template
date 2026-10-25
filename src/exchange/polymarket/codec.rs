@@ -431,6 +431,20 @@ mod tests {
     }
 
     #[test]
+    fn one_malformed_change_rejects_the_whole_frame() {
+        // The second change has no side. The frame is rejected as a whole,
+        // so a partially applied batch can never reach the core.
+        let payload = r#"{
+            "event_type":"price_change","market":"0xabc","timestamp":"1757908892351",
+            "price_changes":[
+              {"asset_id":"123","price":"0.5","size":"10","side":"BUY","hash":"h"},
+              {"asset_id":"456","price":"0.4","size":"0"}
+            ]
+        }"#;
+        assert!(decode_polymarket_message(payload, NOW).is_err());
+    }
+
+    #[test]
     fn ignores_unknown_events_and_rejects_malformed_books() {
         let events =
             decode_polymarket_message(r#"{"event_type":"best_bid_ask","asset_id":"1"}"#, NOW)
