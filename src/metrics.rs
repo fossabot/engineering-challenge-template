@@ -157,118 +157,128 @@ impl MetricsRegistry {
         let mut out = String::with_capacity(4096);
         let core = &snapshot.core;
         macro_rules! metric {
-            ($name:literal, $help:literal, $value:expr) => {
+            ($type:literal, $name:literal, $help:literal, $value:expr) => {
                 out.push_str(concat!("# HELP ", $name, " ", $help, "\n"));
-                out.push_str(concat!("# TYPE ", $name, " gauge\n"));
+                out.push_str(concat!("# TYPE ", $name, " ", $type, "\n"));
                 out.push_str($name);
                 out.push(' ');
                 out.push_str(&$value.to_string());
                 out.push('\n');
             };
         }
-        metric!(
+        macro_rules! gauge {
+            ($name:literal, $help:literal, $value:expr) => {
+                metric!("gauge", $name, $help, $value)
+            };
+        }
+        macro_rules! counter {
+            ($name:literal, $help:literal, $value:expr) => {
+                metric!("counter", $name, $help, $value)
+            };
+        }
+        gauge!(
             "collector_symbols_active",
             "Symbols currently subscribed",
             core.current_symbols
         );
-        metric!("collector_shards", "Configured shards", core.shard_count);
-        metric!(
+        gauge!("collector_shards", "Configured shards", core.shard_count);
+        counter!(
             "collector_exchange_snapshots_total",
             "Snapshots received from exchanges",
             core.exchange_snapshots
         );
-        metric!(
+        counter!(
             "collector_periodic_snapshots_total",
             "Locally generated periodic snapshots",
             core.periodic_snapshots
         );
-        metric!(
+        counter!(
             "collector_failover_snapshots_total",
             "Snapshots emitted on source switch",
             core.failover_snapshots
         );
-        metric!(
+        counter!(
             "collector_final_snapshots_total",
             "Snapshots emitted during shutdown",
             core.final_snapshots
         );
-        metric!(
+        counter!(
             "collector_empty_snapshots_total",
             "Empty snapshots emitted on removal",
             core.empty_snapshots
         );
-        metric!(
+        counter!(
             "collector_deltas_emitted_total",
             "Absolute price-level updates emitted",
             core.deltas_emitted
         );
-        metric!(
+        counter!(
             "collector_deltas_rejected_total",
             "Rejected inconsistent updates",
             core.deltas_rejected
         );
-        metric!(
+        counter!(
             "collector_sequence_resets_total",
             "Source resets caused by sequence/stream faults",
             core.sequence_resets
         );
-        metric!(
+        counter!(
             "collector_clock_resets_total",
             "Exchange clock regressions treated as maintenance epochs",
             core.clock_resets
         );
-        metric!(
+        counter!(
             "collector_source_switches_total",
             "Active-source failovers",
             core.source_switches
         );
-        metric!(
+        counter!(
             "collector_stale_probes_total",
             "Quiet-symbol probes",
             core.stale_probes
         );
-        metric!(
+        counter!(
             "collector_stale_failovers_total",
             "Failovers caused by failed probes",
             core.stale_failovers
         );
-        metric!(
+        counter!(
             "collector_crossed_snapshots_skipped_total",
             "Crossed snapshots skipped",
             core.crossed_snapshots_skipped
         );
-        metric!(
+        counter!(
             "collector_discovery_rounds_total",
             "Market discovery rounds",
             core.discovery_rounds
         );
-        metric!(
+        counter!(
             "collector_writer_messages_total",
             "SBE messages written",
             snapshot.writer.messages
         );
-        metric!(
+        counter!(
             "collector_writer_bytes_total",
             "Bytes written including padding",
             snapshot.writer.bytes
         );
-        metric!(
+        counter!(
             "collector_writer_errors_total",
             "Writer errors",
             snapshot.writer.errors
         );
-        metric!(
+        gauge!(
             "collector_writer_queue_depth",
             "Messages waiting for the writer",
             snapshot.writer.queue_depth
         );
-        metric!(
+        gauge!(
             "collector_sources_connected",
             "Connected websocket sources",
             snapshot.sources.iter().filter(|s| s.connected).count()
         );
-        metric!(
-            "collector_sources_total",
+        gauge!(
+            "collector_sources_configured",
             "Configured websocket sources",
             snapshot.sources.len()
         );
@@ -434,5 +444,23 @@ mod tests {
         assert!(degraded.contains("\"status\":\"degraded\""));
         assert!(degraded.contains("\"sources_connected\":1"));
         assert!(degraded.contains("\"sources_total\":3"));
+
+        // Every source failing must also report degraded, not ok.
+        let down = registry_with(&[(0, 0, false), (0, 1, false)]).health_payload();
+        assert!(down.contains("\"status\":\"degraded\""));
+        assert!(down.contains("\"sources_connected\":0"));
+        assert!(down.contains("\"sources_total\":2"));
+    }
+
+    #[test]
+    fn prometheus_types_split_gauges_and_counters() {
+        let registry = registry_with(&[(0, 0, true)]);
+        let text = registry.render_prometheus();
+        assert!(text.contains("# TYPE collector_symbols_active gauge"));
+        assert!(text.contains("# TYPE collector_sources_connected gauge"));
+        assert!(text.contains("# TYPE collector_writer_queue_depth gauge"));
+        assert!(text.contains("# TYPE collector_deltas_emitted_total counter"));
+        assert!(text.contains("# TYPE collector_writer_errors_total counter"));
+        assert!(text.contains("# TYPE collector_discovery_rounds_total counter"));
     }
 }

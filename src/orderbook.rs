@@ -304,7 +304,7 @@ mod tests {
             "failed replace must leave the book unchanged"
         );
 
-        // Duplicate asks are malformed too.
+        // Duplicate asks are malformed too, with the same exact error.
         let mut snapshot = BookSnapshot::default();
         snapshot.bids.push(Level {
             price: 400_000,
@@ -319,7 +319,13 @@ mod tests {
             quantity: 5_000_000,
         });
         let mut book = OrderBook::new();
-        assert!(book.replace(&snapshot).is_err());
+        assert!(matches!(
+            book.replace(&snapshot),
+            Err(BookError::DuplicateLevel {
+                side: Side::Sell,
+                price: 600_000
+            })
+        ));
 
         // The same price on both sides is a locked book, not a duplicate.
         let mut snapshot = BookSnapshot::default();
@@ -372,6 +378,12 @@ mod tests {
             quantity: -1,
         });
         let mut book = OrderBook::new();
-        assert!(book.replace(&snapshot).is_err());
+        assert!(matches!(
+            book.replace(&snapshot),
+            Err(BookError::NegativeQuantity {
+                price: 400_000,
+                quantity: -1
+            })
+        ));
     }
 }
