@@ -1,6 +1,6 @@
 //! Timestamp conversion helpers.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
@@ -11,6 +11,35 @@ pub fn now_us() -> anyhow::Result<i64> {
         .duration_since(UNIX_EPOCH)
         .context("system clock predates the Unix epoch")?;
     i64::try_from(elapsed.as_micros()).context("current timestamp exceeds i64 microseconds")
+}
+
+/// A wall-clock-anchored monotonic clock for durations and scheduling.
+///
+/// The base reading comes from the system wall clock once; later readings add
+/// elapsed [`Instant`] time. Durations therefore do not jump when the system
+/// clock is adjusted, while generated output still carries epoch-microsecond
+/// timestamps. Event receive timestamps must continue to use [`now_us`]: they
+/// describe when the exchange frame actually arrived, not elapsed run time.
+#[derive(Debug, Clone, Copy)]
+pub struct MonotonicClock {
+    base_us: i64,
+    started: Instant,
+}
+
+impl MonotonicClock {
+    #[must_use]
+    pub fn new(base_us: i64) -> Self {
+        Self {
+            base_us,
+            started: Instant::now(),
+        }
+    }
+
+    #[must_use]
+    pub fn now_us(&self) -> i64 {
+        let elapsed = i64::try_from(self.started.elapsed().as_micros()).unwrap_or(i64::MAX);
+        self.base_us.saturating_add(elapsed)
+    }
 }
 
 /// Current wall-clock time as a UTC datetime.
@@ -84,6 +113,15 @@ mod tests {
             parse_millis_or_rfc3339_us("2026-06-29T17:15:57.257000Z").unwrap(),
             expected
         );
+    }
+
+    #[test]
+    fn monotonic_clock_keeps_the_wall_clock_base_and_never_regresses() {
+        let clock = MonotonicClock::new(1_700_000_000_000_000);
+        let first = clock.now_us();
+        let second = clock.now_us();
+        assert!(first >= 1_700_000_000_000_000);
+        assert!(second >= first);
     }
 
     #[test]

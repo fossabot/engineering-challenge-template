@@ -29,7 +29,7 @@ use crate::{
     model::{Control, MarketInfo, OutputMessage, SourceId},
     report::{MarketMetadata, ReportConfig, RunReport, sidecar_path},
     session::{WorkerConfig, WorkerEvent, run_worker},
-    time::now_us,
+    time::{MonotonicClock, now_us},
     writer::WriterHandle,
 };
 
@@ -55,8 +55,38 @@ pub fn build_exchange(
 /// Run a live collection until SIGINT/SIGTERM, the configured duration, or a
 /// fatal source/writer error.
 pub async fn run(settings: Settings) -> anyhow::Result<RunReport> {
+    let duration_secs = settings.collector.duration_secs;
+    run_with_shutdown(settings, async move {
+        let signal = wait_for_shutdown_signal();
+        tokio::pin!(signal);
+        if duration_secs == 0 {
+            signal.await
+        } else {
+            tokio::select! {
+                reason = &mut signal => reason,
+                _ = tokio::time::sleep(Duration::from_secs(duration_secs)) => {
+                    format!("duration elapsed ({duration_secs}s)")
+                }
+            }
+        }
+    })
+    .await
+}
+
+/// Run a live collection until the supplied future resolves.
+///
+/// `shutdown` returns the human-readable shutdown reason recorded in the run
+/// report. This is the same loop used by [`run`]; separating the trigger keeps
+/// the live orchestration testable without relying on process signals or a
+/// fixed wall-clock duration. `collector.duration_secs` is interpreted by
+/// [`run`], not by this function.
+pub async fn run_with_shutdown<F>(settings: Settings, shutdown: F) -> anyhow::Result<RunReport>
+where
+    F: std::future::Future<Output = String>,
+{
     settings.validate()?;
     let started_at_us = now_us().context("reading wall clock at startup")?;
+    let clock = MonotonicClock::new(started_at_us);
     let exchange = build_exchange(&settings, true)?;
     let initial_markets =
         discover_with_retry(&exchange, settings.collector.max_markets, exchange.name()).await?;
@@ -144,28 +174,14 @@ pub async fn run(settings: Settings) -> anyhow::Result<RunReport> {
     let (discovery_tx, mut discovery_rx) = mpsc::channel::<anyhow::Result<Vec<MarketInfo>>>(1);
     let mut discovery_in_flight = false;
 
-    let signal = wait_for_shutdown_signal();
-    tokio::pin!(signal);
-    let duration_secs = settings.collector.duration_secs;
-    let duration_sleep = async move {
-        if duration_secs == 0 {
-            std::future::pending::<()>().await;
-        } else {
-            tokio::time::sleep(Duration::from_secs(duration_secs)).await;
-        }
-    };
-    tokio::pin!(duration_sleep);
+    let mut shutdown = std::pin::pin!(shutdown);
 
     let mut shutdown_reason = String::new();
     let mut fatal: Option<String> = None;
     loop {
         tokio::select! {
-            reason = &mut signal => {
+            reason = &mut shutdown => {
                 shutdown_reason = reason;
-                break;
-            }
-            _ = &mut duration_sleep => {
-                shutdown_reason = format!("duration elapsed ({duration_secs}s)");
                 break;
             }
             event = worker_event_rx.recv() => {
@@ -194,7 +210,9 @@ pub async fn run(settings: Settings) -> anyhow::Result<RunReport> {
                 }
             }
             _ = ticker.tick() => {
-                let now = now_us().context("reading wall clock for collector tick")?;
+                // Scheduling durations use the monotonic clock; event receive
+                // timestamps remain raw wall-clock readings.
+                let now = clock.now_us();
                 let outputs = core.tick(now);
                 if let Err(error) = emit_outputs(&writer, outputs, send_timeout).await {
                     fatal = Some(format!("{error:#}"));
@@ -240,7 +258,7 @@ pub async fn run(settings: Settings) -> anyhow::Result<RunReport> {
                         );
                     }
                     Some(Ok(markets)) => {
-                        let now = now_us().context("reading wall clock for discovery")?;
+                        let now = clock.now_us();
                         match core.apply_discovery(now, markets) {
                             Ok(outputs) => {
                                 if let Err(error) =
@@ -301,10 +319,11 @@ pub async fn run(settings: Settings) -> anyhow::Result<RunReport> {
     }
     info!(reason = %shutdown_reason, "shutting down collector");
     let ended_at_us = now_us().unwrap_or(started_at_us);
+    let finalize_at_us = clock.now_us();
     core.begin_shutdown();
     let mut shutdown_error: Option<anyhow::Error> = None;
     if settings.collector.final_snapshots {
-        let outputs = core.finalize(ended_at_us);
+        let outputs = core.finalize(finalize_at_us);
         if let Err(error) = emit_outputs(&writer, outputs, send_timeout).await {
             shutdown_error = Some(error);
         }
