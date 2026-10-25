@@ -1,0 +1,1660 @@
+//! End-to-end tests against an independent mock exchange.
+//!
+//! These tests drive the real `coordinator::run_with_shutdown`, the real
+//! Polymarket discovery/session adapters, the real collector core, the real
+//! serialized SBE writer, and the real SBE reader. The mock exchange owns an
+//! independent authoritative book and event history; it is deliberately not a
+//! second implementation of the collector state machine.
+//!
+//! `verify` is only a capture self-consistency check. The oracle for capture
+//! completeness under these scenarios is the mock exchange's full delivered
+//! update history plus the snapshots it sent at recovery boundaries.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::SocketAddr,
+    path::Path,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+
+use engineering_challenge::{
+    Side,
+    config::{ExchangeKind, Settings},
+    coordinator,
+    fixed::format_micros,
+    report::RunReport,
+    time::now_us,
+    util::{
+        AlignedSbeReader, OrderbookSchema,
+        dtos::challenge_orderbook::{AnyMessage, PriceLevelUpdateDomain, SnapshotDomain},
+    },
+    verify::{self, VerifySummary},
+};
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{Value, json};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::{Notify, broadcast, mpsc, oneshot},
+    task::JoinHandle,
+    time::sleep,
+};
+use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+const CHUNK_SIZE: usize = 16 * 1024;
+const CHUNK_STR: &str = "16384";
+const WAIT_LIMIT: Duration = Duration::from_secs(15);
+const SYMBOL_A: &str = "polymarket:cond-a:0";
+
+fn market(condition: &str, token: &str) -> MarketSpec {
+    MarketSpec {
+        condition_id: condition.to_owned(),
+        token_id: token.to_owned(),
+        question: format!("Mock market {condition}"),
+    }
+}
+
+fn test_settings(mock: &MockExchange, output: &Path) -> Settings {
+    let mut settings = Settings::load(None).expect("loading default settings");
+    settings.exchange = ExchangeKind::Polymarket;
+    settings.polymarket.gamma_url = format!("http://{}", mock.http_addr);
+    settings.polymarket.ws_url = format!("ws://{}/ws", mock.ws_addr);
+    settings.polymarket.batch_size = 500;
+    settings.polymarket.discovery_page_size = 100;
+    settings.polymarket.request_timeout_secs = 5;
+    settings.polymarket.discovery_page_delay_ms = 0;
+    settings.polymarket.require_accepting_orders = true;
+
+    settings.collector.shards = 1;
+    settings.collector.replicas = 2;
+    settings.collector.snapshot_interval_secs = 60;
+    settings.collector.discovery_interval_secs = 60;
+    settings.collector.reconnect_after_secs = 1800;
+    settings.collector.connection_idle_timeout_secs = 45;
+    settings.collector.stale_probe_after_secs = 120;
+    settings.collector.probe_interval_secs = 30;
+    settings.collector.max_probes = 3;
+    settings.collector.writer_queue = 4096;
+    settings.collector.flush_interval_secs = 1;
+    settings.collector.max_markets = 0;
+    settings.collector.duration_secs = 0;
+    settings.collector.final_snapshots = true;
+    settings.collector.writer_send_timeout_secs = 5;
+
+    settings.output.path = output.display().to_string();
+    settings.output.chunk_size = CHUNK_SIZE;
+    settings.output.metadata_path = None;
+    settings.output.report_path = None;
+    settings.output.sync_on_close = false;
+    settings.metrics.listen = None;
+    settings.network = Default::default();
+    settings
+}
+
+fn spawn_collector(settings: Settings, done: Arc<Notify>) -> JoinHandle<anyhow::Result<RunReport>> {
+    tokio::spawn(coordinator::run_with_shutdown(settings, async move {
+        tokio::select! {
+            _ = done.notified() => "test scenario complete".to_owned(),
+            _ = sleep(Duration::from_secs(30)) => "test scenario safety timeout".to_owned(),
+        }
+    }))
+}
+
+async fn finish_collector(handle: JoinHandle<anyhow::Result<RunReport>>) -> RunReport {
+    match tokio::time::timeout(Duration::from_secs(35), handle).await {
+        Ok(Ok(Ok(report))) => report,
+        Ok(Ok(Err(error))) => panic!("collector failed: {error:#}"),
+        Ok(Err(error)) => panic!("collector task failed: {error}"),
+        Err(_) => panic!("collector did not stop within 35 seconds"),
+    }
+}
+
+async fn wait_until(what: &str, mut predicate: impl FnMut() -> bool) {
+    wait_until_for(WAIT_LIMIT, what, &mut predicate).await;
+}
+
+async fn wait_until_for(limit: Duration, what: &str, mut predicate: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        if predicate() {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out after {limit:?} waiting for {what}");
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Independent exchange model
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct MockBook {
+    bids: BTreeMap<i64, i64>,
+    asks: BTreeMap<i64, i64>,
+}
+
+impl MockBook {
+    fn set(&mut self, side: Side, price: i64, quantity: i64) {
+        let levels = match side {
+            Side::Buy => &mut self.bids,
+            Side::Sell => &mut self.asks,
+        };
+        if quantity == 0 {
+            levels.remove(&price);
+        } else {
+            levels.insert(price, quantity);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bids.is_empty() && self.asks.is_empty()
+    }
+
+    fn from_snapshot(snapshot: &SnapshotDomain) -> Self {
+        let mut book = Self::default();
+        for level in &snapshot.bids {
+            if level.quantity != 0 {
+                book.bids.insert(level.price_level, level.quantity);
+            }
+        }
+        for level in &snapshot.asks {
+            if level.quantity != 0 {
+                book.asks.insert(level.price_level, level.quantity);
+            }
+        }
+        book
+    }
+
+    fn book_json(&self, token: &str) -> Value {
+        json!({
+            "event_type": "book",
+            "asset_id": token,
+            "market": "mock",
+            "bids": self.bids.iter().rev().map(|(price, quantity)| json!({
+                "price": format_micros(*price),
+                "size": format_micros(*quantity),
+            })).collect::<Vec<_>>(),
+            "asks": self.asks.iter().map(|(price, quantity)| json!({
+                "price": format_micros(*price),
+                "size": format_micros(*quantity),
+            })).collect::<Vec<_>>(),
+            "timestamp": mock_timestamp_ms().to_string(),
+            "hash": "mock",
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MarketSpec {
+    condition_id: String,
+    token_id: String,
+    question: String,
+}
+
+impl MarketSpec {
+    fn gamma_json(&self) -> Value {
+        json!({
+            "conditionId": self.condition_id,
+            "question": self.question,
+            "active": true,
+            "closed": false,
+            "archived": false,
+            "enableOrderBook": true,
+            "acceptingOrders": true,
+            "version": "v1",
+            "clobTokenIds": serde_json::to_string(&[&self.token_id]).expect("token JSON"),
+            "outcomes": serde_json::to_string(&["Yes"]).expect("outcome JSON"),
+            "orderPriceMinTickSize": "0.01",
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MockUpdate {
+    token: String,
+    side: Side,
+    price: i64,
+    quantity: i64,
+    delivered: bool,
+    resulting: MockBook,
+}
+
+#[derive(Debug, Clone)]
+struct SubscriptionFrame {
+    connection: u64,
+    operation: String,
+    assets: usize,
+    initial: bool,
+}
+
+struct Connection {
+    subscribed: BTreeSet<String>,
+    outbound: mpsc::UnboundedSender<Outbound>,
+    close: Option<oneshot::Sender<()>>,
+    initial_gate: Option<Arc<Notify>>,
+    initial_dump_sent: bool,
+}
+
+enum Outbound {
+    Text(String),
+    Close,
+}
+
+struct MockState {
+    markets: Mutex<Vec<MarketSpec>>,
+    truth: Mutex<BTreeMap<String, MockBook>>,
+    updates: Mutex<Vec<MockUpdate>>,
+    connections: Mutex<BTreeMap<u64, Connection>>,
+    subscription_log: Mutex<Vec<SubscriptionFrame>>,
+    next_id: AtomicU64,
+    reject_connections: AtomicBool,
+    suppress_deltas: AtomicBool,
+    gate_second: bool,
+    shutdown: broadcast::Sender<()>,
+}
+
+impl MockState {
+    fn new(markets: Vec<MarketSpec>, gate_second: bool) -> Self {
+        let (shutdown, _) = broadcast::channel(1);
+        Self {
+            markets: Mutex::new(markets),
+            truth: Mutex::new(BTreeMap::new()),
+            updates: Mutex::new(Vec::new()),
+            connections: Mutex::new(BTreeMap::new()),
+            subscription_log: Mutex::new(Vec::new()),
+            next_id: AtomicU64::new(0),
+            reject_connections: AtomicBool::new(false),
+            suppress_deltas: AtomicBool::new(false),
+            gate_second,
+            shutdown,
+        }
+    }
+
+    fn set_book(&self, token: &str, bids: &[(i64, i64)], asks: &[(i64, i64)]) {
+        let mut book = MockBook::default();
+        for (price, quantity) in bids {
+            book.bids.insert(*price, *quantity);
+        }
+        for (price, quantity) in asks {
+            book.asks.insert(*price, *quantity);
+        }
+        self.truth
+            .lock()
+            .expect("truth lock")
+            .insert(token.to_owned(), book);
+    }
+
+    fn book(&self, token: &str) -> MockBook {
+        self.truth
+            .lock()
+            .expect("truth lock")
+            .get(token)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn set_markets(&self, markets: Vec<MarketSpec>) {
+        *self.markets.lock().expect("markets lock") = markets;
+    }
+
+    fn register(
+        &self,
+        id: u64,
+        outbound: mpsc::UnboundedSender<Outbound>,
+        close: oneshot::Sender<()>,
+    ) {
+        let initial_gate = (self.gate_second && id == 1).then(|| Arc::new(Notify::new()));
+        self.connections.lock().expect("connections lock").insert(
+            id,
+            Connection {
+                subscribed: BTreeSet::new(),
+                outbound,
+                close: Some(close),
+                initial_gate,
+                initial_dump_sent: false,
+            },
+        );
+    }
+
+    fn unregister(&self, id: u64) {
+        self.connections
+            .lock()
+            .expect("connections lock")
+            .remove(&id);
+    }
+
+    fn release_initial(&self, id: u64) {
+        if let Some(gate) = self
+            .connections
+            .lock()
+            .expect("connections lock")
+            .get(&id)
+            .and_then(|connection| connection.initial_gate.clone())
+        {
+            gate.notify_one();
+        }
+    }
+
+    fn close_connection(&self, id: u64) {
+        if let Some(mut connection) = self
+            .connections
+            .lock()
+            .expect("connections lock")
+            .remove(&id)
+        {
+            if let Some(close) = connection.close.take() {
+                let _ = close.send(());
+            }
+            let _ = connection.outbound.send(Outbound::Close);
+        }
+    }
+
+    fn close_all(&self) {
+        let connections = std::mem::take(&mut *self.connections.lock().expect("connections lock"));
+        for (_, mut connection) in connections {
+            if let Some(close) = connection.close.take() {
+                let _ = close.send(());
+            }
+            let _ = connection.outbound.send(Outbound::Close);
+        }
+    }
+
+    fn connection_count(&self) -> usize {
+        self.connections.lock().expect("connections lock").len()
+    }
+
+    fn next_id(&self) -> u64 {
+        self.next_id.load(Ordering::SeqCst)
+    }
+
+    fn max_connection_id(&self) -> Option<u64> {
+        self.connections
+            .lock()
+            .expect("connections lock")
+            .keys()
+            .next_back()
+            .copied()
+    }
+
+    fn subscription_count(&self, token: &str) -> usize {
+        self.connections
+            .lock()
+            .expect("connections lock")
+            .values()
+            .filter(|connection| connection.subscribed.contains(token))
+            .count()
+    }
+
+    fn total_subscriptions(&self) -> usize {
+        self.connections
+            .lock()
+            .expect("connections lock")
+            .values()
+            .map(|connection| connection.subscribed.len())
+            .sum()
+    }
+
+    fn max_subscriptions_per_connection(&self) -> usize {
+        self.connections
+            .lock()
+            .expect("connections lock")
+            .values()
+            .map(|connection| connection.subscribed.len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn set_reject_connections(&self, reject: bool) {
+        self.reject_connections.store(reject, Ordering::SeqCst);
+    }
+
+    fn set_suppress_deltas(&self, suppress: bool) {
+        self.suppress_deltas.store(suppress, Ordering::SeqCst);
+    }
+
+    fn publish_delta(&self, token: &str, side: Side, price: i64, quantity: i64) -> bool {
+        let resulting = {
+            let mut truth = self.truth.lock().expect("truth lock");
+            let book = truth.entry(token.to_owned()).or_default();
+            book.set(side, price, quantity);
+            book.clone()
+        };
+        let suppressed = self.suppress_deltas.load(Ordering::SeqCst);
+        let frame = (!suppressed).then(|| delta_json(token, side, price, quantity));
+        let mut delivered = false;
+        if let Some(frame) = frame {
+            let targets: Vec<mpsc::UnboundedSender<Outbound>> = self
+                .connections
+                .lock()
+                .expect("connections lock")
+                .values()
+                .filter(|connection| {
+                    connection.subscribed.contains(token) && connection.initial_dump_sent
+                })
+                .map(|connection| connection.outbound.clone())
+                .collect();
+            for target in targets {
+                if target.send(Outbound::Text(frame.clone())).is_ok() {
+                    delivered = true;
+                }
+            }
+        }
+        self.updates.lock().expect("updates lock").push(MockUpdate {
+            token: token.to_owned(),
+            side,
+            price,
+            quantity,
+            delivered,
+            resulting,
+        });
+        delivered
+    }
+
+    fn delivered_updates_for(&self, token: &str) -> Vec<MockUpdate> {
+        self.updates
+            .lock()
+            .expect("updates lock")
+            .iter()
+            .filter(|update| update.token == token && update.delivered)
+            .cloned()
+            .collect()
+    }
+
+    fn all_updates_for(&self, token: &str) -> Vec<MockUpdate> {
+        self.updates
+            .lock()
+            .expect("updates lock")
+            .iter()
+            .filter(|update| update.token == token)
+            .cloned()
+            .collect()
+    }
+
+    fn book_frames(&self, assets: &[String], as_array: bool) -> Vec<String> {
+        let truth = self.truth.lock().expect("truth lock");
+        let books: Vec<Value> = assets
+            .iter()
+            .filter_map(|asset| truth.get(asset).map(|book| book.book_json(asset)))
+            .collect();
+        if books.is_empty() {
+            return Vec::new();
+        }
+        if as_array {
+            vec![Value::Array(books).to_string()]
+        } else {
+            books.into_iter().map(|book| book.to_string()).collect()
+        }
+    }
+
+    async fn handle_client_message(&self, id: u64, text: &str) -> Vec<String> {
+        let trimmed = text.trim();
+        if trimmed.eq_ignore_ascii_case("PING") {
+            return vec!["PONG".to_owned()];
+        }
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("PONG") {
+            return Vec::new();
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            return Vec::new();
+        };
+        if value.get("type").and_then(Value::as_str) == Some("market") {
+            let assets = string_array(value.get("assets_ids"));
+            let initial = value
+                .get("initial_dump")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let gate = {
+                let mut connections = self.connections.lock().expect("connections lock");
+                let Some(connection) = connections.get_mut(&id) else {
+                    return Vec::new();
+                };
+                connection.subscribed = assets.iter().cloned().collect();
+                connection.initial_gate.clone()
+            };
+            self.subscription_log
+                .lock()
+                .expect("subscription log")
+                .push(SubscriptionFrame {
+                    connection: id,
+                    operation: "initial_dump".to_owned(),
+                    assets: assets.len(),
+                    initial,
+                });
+            if initial {
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
+                if let Some(connection) = self
+                    .connections
+                    .lock()
+                    .expect("connections lock")
+                    .get_mut(&id)
+                {
+                    connection.initial_dump_sent = true;
+                }
+                return self.book_frames(&assets, true);
+            }
+            return Vec::new();
+        }
+        if let Some(operation) = value.get("operation").and_then(Value::as_str) {
+            let assets = string_array(value.get("assets_ids"));
+            {
+                let mut connections = self.connections.lock().expect("connections lock");
+                let Some(connection) = connections.get_mut(&id) else {
+                    return Vec::new();
+                };
+                match operation {
+                    "subscribe" => connection.subscribed.extend(assets.iter().cloned()),
+                    "unsubscribe" => {
+                        for asset in &assets {
+                            connection.subscribed.remove(asset);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            self.subscription_log
+                .lock()
+                .expect("subscription log")
+                .push(SubscriptionFrame {
+                    connection: id,
+                    operation: operation.to_owned(),
+                    assets: assets.len(),
+                    initial: false,
+                });
+            if operation == "subscribe" {
+                return self.book_frames(&assets, false);
+            }
+        }
+        Vec::new()
+    }
+
+    fn gamma_response(&self, target: &str) -> (u16, String) {
+        let path = target.split('?').next().unwrap_or_default();
+        if path != "/markets/keyset" {
+            return (404, json!({"error": "not found"}).to_string());
+        }
+        let query = target.split_once('?').map_or("", |(_, query)| query);
+        let mut limit = 100usize;
+        let mut offset = 0usize;
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            match key {
+                "limit" => limit = value.parse().unwrap_or(100),
+                "after_cursor" => offset = value.parse().unwrap_or(0),
+                _ => {}
+            }
+        }
+        let markets = self.markets.lock().expect("markets lock");
+        let start = offset.min(markets.len());
+        let end = start.saturating_add(limit.max(1)).min(markets.len());
+        let page: Vec<Value> = markets[start..end]
+            .iter()
+            .map(MarketSpec::gamma_json)
+            .collect();
+        let mut body = json!({"markets": page});
+        if end < markets.len() {
+            body["next_cursor"] = json!(end.to_string());
+        }
+        (200, body.to_string())
+    }
+}
+
+struct MockExchange {
+    http_addr: SocketAddr,
+    ws_addr: SocketAddr,
+    state: Arc<MockState>,
+    http_task: JoinHandle<()>,
+    ws_task: JoinHandle<()>,
+}
+
+impl MockExchange {
+    async fn start(markets: Vec<MarketSpec>, gate_second: bool) -> Self {
+        let state = Arc::new(MockState::new(markets, gate_second));
+        let http_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind Gamma");
+        let ws_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind websocket");
+        let http_addr = http_listener.local_addr().expect("Gamma address");
+        let ws_addr = ws_listener.local_addr().expect("websocket address");
+        let http_task = tokio::spawn(run_http(
+            http_listener,
+            Arc::clone(&state),
+            state.shutdown.subscribe(),
+        ));
+        let ws_task = tokio::spawn(run_websocket(
+            ws_listener,
+            Arc::clone(&state),
+            state.shutdown.subscribe(),
+        ));
+        Self {
+            http_addr,
+            ws_addr,
+            state,
+            http_task,
+            ws_task,
+        }
+    }
+
+    fn set_book(&self, token: &str, bids: &[(i64, i64)], asks: &[(i64, i64)]) {
+        self.state.set_book(token, bids, asks);
+    }
+
+    fn book(&self, token: &str) -> MockBook {
+        self.state.book(token)
+    }
+
+    fn set_markets(&self, markets: Vec<MarketSpec>) {
+        self.state.set_markets(markets);
+    }
+
+    fn publish_delta(&self, token: &str, side: Side, price: i64, quantity: i64) -> bool {
+        self.state.publish_delta(token, side, price, quantity)
+    }
+
+    fn delivered_updates_for(&self, token: &str) -> Vec<MockUpdate> {
+        self.state.delivered_updates_for(token)
+    }
+
+    fn all_updates_for(&self, token: &str) -> Vec<MockUpdate> {
+        self.state.all_updates_for(token)
+    }
+
+    fn release_initial(&self, id: u64) {
+        self.state.release_initial(id);
+    }
+
+    fn close_connection(&self, id: u64) {
+        self.state.close_connection(id);
+    }
+
+    fn close_all(&self) {
+        self.state.close_all();
+    }
+
+    fn set_reject_connections(&self, reject: bool) {
+        self.state.set_reject_connections(reject);
+    }
+
+    fn set_suppress_deltas(&self, suppress: bool) {
+        self.state.set_suppress_deltas(suppress);
+    }
+
+    fn next_id(&self) -> u64 {
+        self.state.next_id()
+    }
+
+    fn total_subscriptions(&self) -> usize {
+        self.state.total_subscriptions()
+    }
+
+    fn max_subscriptions_per_connection(&self) -> usize {
+        self.state.max_subscriptions_per_connection()
+    }
+
+    fn subscription_log(&self) -> Vec<SubscriptionFrame> {
+        self.state
+            .subscription_log
+            .lock()
+            .expect("subscription log")
+            .clone()
+    }
+
+    async fn wait_for_connections(&self, count: usize) {
+        wait_until(&format!("{count} websocket connections"), || {
+            self.state.connection_count() >= count
+        })
+        .await;
+    }
+
+    async fn wait_for_subscriptions(&self, token: &str, count: usize) {
+        wait_until(&format!("{count} subscriptions to {token}"), || {
+            self.state.subscription_count(token) >= count
+        })
+        .await;
+    }
+
+    async fn wait_for_total_subscriptions(&self, count: usize) {
+        wait_until(&format!("{count} total subscriptions"), || {
+            self.state.total_subscriptions() >= count
+        })
+        .await;
+    }
+
+    async fn wait_for_new_connection(&self, previous_next_id: u64) {
+        wait_until_for(
+            Duration::from_secs(20),
+            "a reconnected websocket",
+            &mut || {
+                self.state.next_id() > previous_next_id
+                    && self
+                        .state
+                        .max_connection_id()
+                        .is_some_and(|id| id >= previous_next_id)
+            },
+        )
+        .await;
+    }
+
+    async fn wait_for_new_connections(&self, previous_next_id: u64, count: usize) {
+        wait_until_for(
+            Duration::from_secs(20),
+            &format!("{count} reconnected websockets"),
+            &mut || {
+                self.state.next_id() >= previous_next_id.saturating_add(count as u64)
+                    && self.state.connection_count() >= count
+            },
+        )
+        .await;
+    }
+}
+
+impl Drop for MockExchange {
+    fn drop(&mut self) {
+        let _ = self.state.shutdown.send(());
+        self.http_task.abort();
+        self.ws_task.abort();
+    }
+}
+
+async fn run_http(
+    listener: TcpListener,
+    state: Arc<MockState>,
+    mut shutdown: broadcast::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown.recv() => break,
+            accepted = listener.accept() => {
+                let Ok((mut socket, _)) = accepted else { continue };
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buffer = [0u8; 4096];
+                    loop {
+                        match socket.read(&mut buffer).await {
+                            Ok(0) => break,
+                            Ok(read) => {
+                                request.extend_from_slice(&buffer[..read]);
+                                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                        if request.len() > 64 * 1024 {
+                            return;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&request);
+                    let target = text
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let (status, body) = state.gamma_response(target);
+                    let reason = if status == 200 { "OK" } else { "Not Found" };
+                    let head = format!(
+                        "HTTP/1.1 {status} {reason}\r\n\
+                         Content-Type: application/json\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: close\r\n\
+                         \r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(body.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        }
+    }
+}
+
+async fn run_websocket(
+    listener: TcpListener,
+    state: Arc<MockState>,
+    mut shutdown: broadcast::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown.recv() => break,
+            accepted = listener.accept() => {
+                let Ok((socket, _)) = accepted else { continue };
+                if state.reject_connections.load(Ordering::SeqCst) {
+                    drop(socket);
+                    continue;
+                }
+                let id = state.next_id.fetch_add(1, Ordering::SeqCst);
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    handle_connection(id, socket, state).await;
+                });
+            }
+        }
+    }
+}
+
+async fn handle_connection(id: u64, socket: TcpStream, state: Arc<MockState>) {
+    let Ok(websocket) = accept_async(socket).await else {
+        return;
+    };
+    let (mut sink, mut stream) = websocket.split();
+    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
+    let (close_tx, mut close_rx) = oneshot::channel();
+    state.register(id, outbound_tx, close_tx);
+    let mut shutdown = state.shutdown.subscribe();
+    loop {
+        tokio::select! {
+            _ = shutdown.recv() => break,
+            _ = &mut close_rx => break,
+            message = stream.next() => {
+                match message {
+                    Some(Ok(Message::Text(text))) => {
+                        let outgoing = state.handle_client_message(id, text.as_str()).await;
+                        for frame in outgoing {
+                            if sink.send(Message::Text(frame.into())).await.is_err() {
+                                state.unregister(id);
+                                return;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        let _ = sink.send(Message::Pong(payload)).await;
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => break,
+                }
+            }
+            outbound = outbound_rx.recv() => {
+                match outbound {
+                    Some(Outbound::Text(frame)) => {
+                        if sink.send(Message::Text(frame.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Outbound::Close) | None => break,
+                }
+            }
+        }
+    }
+    let _ = sink.close().await;
+    state.unregister(id);
+}
+
+fn string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn mock_timestamp_ms() -> i64 {
+    now_us().unwrap_or(0) / 1_000
+}
+
+fn delta_json(token: &str, side: Side, price: i64, quantity: i64) -> String {
+    json!({
+        "event_type": "price_change",
+        "market": "mock",
+        "timestamp": mock_timestamp_ms().to_string(),
+        "price_changes": [{
+            "asset_id": token,
+            "price": format_micros(price),
+            "size": format_micros(quantity),
+            "side": match side {
+                Side::Buy => "BUY",
+                Side::Sell => "SELL",
+            },
+            "hash": "mock",
+        }],
+    })
+    .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Capture reader and assertions
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CapturedMessage {
+    Snapshot {
+        symbol: String,
+        received_at_us: i64,
+        book: MockBook,
+    },
+    Delta {
+        symbol: String,
+        received_at_us: i64,
+        side: Side,
+        price: i64,
+        quantity: i64,
+    },
+}
+
+impl CapturedMessage {
+    fn symbol(&self) -> &str {
+        match self {
+            Self::Snapshot { symbol, .. } | Self::Delta { symbol, .. } => symbol,
+        }
+    }
+
+    fn received_at_us(&self) -> i64 {
+        match self {
+            Self::Snapshot { received_at_us, .. } | Self::Delta { received_at_us, .. } => {
+                *received_at_us
+            }
+        }
+    }
+
+    fn delta_fields(&self) -> Option<(Side, i64, i64)> {
+        match self {
+            Self::Delta {
+                side,
+                price,
+                quantity,
+                ..
+            } => Some((*side, *price, *quantity)),
+            Self::Snapshot { .. } => None,
+        }
+    }
+}
+
+fn read_capture(path: &Path) -> Vec<CapturedMessage> {
+    let mut reader = AlignedSbeReader::<OrderbookSchema>::open_with_chunk_size(path, CHUNK_SIZE)
+        .expect("opening capture");
+    let mut messages = Vec::new();
+    while let Some(message) = reader.read_msg().expect("decoding capture message") {
+        match message {
+            AnyMessage::Snapshot(decoder) => {
+                let snapshot =
+                    SnapshotDomain::try_from_decoder(decoder).expect("decoding SBE snapshot");
+                messages.push(CapturedMessage::Snapshot {
+                    symbol: snapshot.symbol.clone(),
+                    received_at_us: snapshot.received_at.timestamp_micros(),
+                    book: MockBook::from_snapshot(&snapshot),
+                });
+            }
+            AnyMessage::PriceLevelUpdate(decoder) => {
+                let update = PriceLevelUpdateDomain::try_from_decoder(decoder)
+                    .expect("decoding SBE price-level update");
+                messages.push(CapturedMessage::Delta {
+                    symbol: update.symbol.clone(),
+                    received_at_us: update.backtest_timestamp.timestamp_micros(),
+                    side: update.side,
+                    price: update.price_level,
+                    quantity: update.quantity,
+                });
+            }
+            _ => panic!("unexpected SBE message variant"),
+        }
+    }
+    messages
+}
+
+fn verify_capture(path: &Path) -> VerifySummary {
+    verify::run(path, CHUNK_STR).expect("running verify")
+}
+
+fn first_snapshot<'a>(capture: &'a [CapturedMessage], symbol: &str) -> &'a MockBook {
+    capture
+        .iter()
+        .find_map(|message| match message {
+            CapturedMessage::Snapshot {
+                symbol: found,
+                book,
+                ..
+            } if found == symbol => Some(book),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no snapshot for {symbol}"))
+}
+
+fn last_snapshot<'a>(capture: &'a [CapturedMessage], symbol: &str) -> &'a MockBook {
+    capture
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            CapturedMessage::Snapshot {
+                symbol: found,
+                book,
+                ..
+            } if found == symbol => Some(book),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no snapshot for {symbol}"))
+}
+
+fn reconstructed_book(capture: &[CapturedMessage], symbol: &str) -> MockBook {
+    let mut book = MockBook::default();
+    for message in capture {
+        match message {
+            CapturedMessage::Snapshot {
+                symbol: found,
+                book: snapshot,
+                ..
+            } if found == symbol => book = snapshot.clone(),
+            CapturedMessage::Delta {
+                symbol: found,
+                side,
+                price,
+                quantity,
+                ..
+            } if found == symbol => book.set(*side, *price, *quantity),
+            _ => {}
+        }
+    }
+    book
+}
+
+fn captured_deltas<'a>(capture: &'a [CapturedMessage], symbol: &str) -> Vec<&'a CapturedMessage> {
+    capture
+        .iter()
+        .filter(|message| matches!(message, CapturedMessage::Delta { symbol: found, .. } if found == symbol))
+        .collect()
+}
+
+fn assert_deltas_match_updates(capture: &[CapturedMessage], updates: &[MockUpdate], symbol: &str) {
+    let deltas = captured_deltas(capture, symbol);
+    assert_eq!(
+        deltas.len(),
+        updates.len(),
+        "captured delta count for {symbol}"
+    );
+    for (message, update) in deltas.into_iter().zip(updates) {
+        let (side, price, quantity) = message.delta_fields().expect("filtered to deltas");
+        assert_eq!(side, update.side, "side for {symbol}");
+        assert_eq!(price, update.price, "price for {symbol}");
+        assert_eq!(quantity, update.quantity, "quantity for {symbol}");
+    }
+}
+
+fn recovery_snapshot<'a>(capture: &'a [CapturedMessage], symbol: &str) -> &'a MockBook {
+    let mut saw_delta = false;
+    for message in capture {
+        match message {
+            CapturedMessage::Delta { symbol: found, .. } if found == symbol => saw_delta = true,
+            CapturedMessage::Snapshot {
+                symbol: found,
+                book,
+                ..
+            } if found == symbol && saw_delta => return book,
+            _ => {}
+        }
+    }
+    panic!("no recovery snapshot after deltas for {symbol}");
+}
+
+fn snapshot_at_or_after_matching(
+    capture: &[CapturedMessage],
+    symbol: &str,
+    received_at_us: i64,
+    expected: &MockBook,
+) {
+    let found = capture.iter().any(|message| {
+        matches!(
+            message,
+            CapturedMessage::Snapshot {
+                symbol: found,
+                received_at_us: at,
+                book,
+            } if found == symbol && *at >= received_at_us && book == expected
+        )
+    });
+    assert!(
+        found,
+        "no snapshot for {symbol} at or after {received_at_us} matched the expected recovery truth {expected:?}"
+    );
+}
+
+fn assert_per_symbol_anchor(capture: &[CapturedMessage], symbol: &str) {
+    let mut seen_snapshot = false;
+    for message in capture.iter().filter(|message| message.symbol() == symbol) {
+        match message {
+            CapturedMessage::Snapshot { .. } => seen_snapshot = true,
+            CapturedMessage::Delta { .. } => {
+                assert!(
+                    seen_snapshot,
+                    "delta for {symbol} appeared before its first snapshot"
+                );
+            }
+        }
+    }
+}
+
+fn assert_delta_receive_times_monotonic(capture: &[CapturedMessage], symbol: &str) {
+    let mut previous_received_at = i64::MIN;
+    for message in capture {
+        if message.symbol() != symbol || message.delta_fields().is_none() {
+            continue;
+        }
+        let received_at = message.received_at_us();
+        assert!(
+            received_at >= previous_received_at,
+            "delta receive times for {symbol} regressed from {previous_received_at} to {received_at}"
+        );
+        previous_received_at = received_at;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenarios
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steady_state_history_matches_mock_exchange_truth() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let output = directory.path().join("steady.sbe");
+    let mock = MockExchange::start(vec![market("cond-a", "asset-a")], false).await;
+    mock.set_book("asset-a", &[(400_000, 10_000_000)], &[(600_000, 5_000_000)]);
+    let initial = mock.book("asset-a");
+    let settings = test_settings(&mock, &output);
+    let done = Arc::new(Notify::new());
+    let handle = spawn_collector(settings, Arc::clone(&done));
+
+    mock.wait_for_connections(2).await;
+    mock.wait_for_subscriptions("asset-a", 2).await;
+    sleep(Duration::from_millis(200)).await;
+
+    for quantity in [11, 12, 13, 14, 15] {
+        assert!(mock.publish_delta("asset-a", Side::Buy, 400_000, quantity * 1_000_000));
+        sleep(Duration::from_millis(20)).await;
+    }
+    for quantity in [6, 7] {
+        assert!(mock.publish_delta("asset-a", Side::Sell, 600_000, quantity * 1_000_000));
+        sleep(Duration::from_millis(20)).await;
+    }
+    sleep(Duration::from_millis(300)).await;
+    done.notify_one();
+    let report = finish_collector(handle).await;
+    let capture = read_capture(&output);
+    let updates = mock.delivered_updates_for("asset-a");
+    assert_eq!(updates.len(), 7);
+    assert_eq!(first_snapshot(&capture, SYMBOL_A), &initial);
+    assert_deltas_match_updates(&capture, &updates, SYMBOL_A);
+    assert_per_symbol_anchor(&capture, SYMBOL_A);
+    assert_delta_receive_times_monotonic(&capture, SYMBOL_A);
+
+    let final_truth = mock.book("asset-a");
+    assert_eq!(reconstructed_book(&capture, SYMBOL_A), final_truth);
+    assert_eq!(last_snapshot(&capture, SYMBOL_A), &final_truth);
+
+    // Compare each intermediate captured state with the mock's state after the
+    // corresponding delivered update, not only the final book.
+    let mut running = initial;
+    for (index, update) in updates.iter().enumerate() {
+        running.set(update.side, update.price, update.quantity);
+        assert_eq!(running, update.resulting, "mock truth after update {index}");
+    }
+
+    let summary = verify_capture(&output);
+    assert!(
+        summary.valid,
+        "verify rejected a clean capture: {summary:?}"
+    );
+    assert_eq!(summary.deltas_before_snapshot, 0);
+    assert_eq!(summary.snapshot_mismatches, 0);
+    assert_eq!(report.core.deltas_emitted, 7);
+    assert_eq!(report.core.final_snapshots, 1);
+    assert_eq!(report.writer.messages as usize, capture.len());
+    assert_eq!(report.shutdown_reason, "test scenario complete");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn single_socket_loss_fails_over_and_emits_anchoring_snapshot() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let output = directory.path().join("socket-loss.sbe");
+    let mock = MockExchange::start(vec![market("cond-a", "asset-a")], true).await;
+    mock.set_book("asset-a", &[(400_000, 10_000_000)], &[(600_000, 5_000_000)]);
+    let settings = test_settings(&mock, &output);
+    let done = Arc::new(Notify::new());
+    let handle = spawn_collector(settings, Arc::clone(&done));
+
+    mock.wait_for_connections(2).await;
+    mock.wait_for_subscriptions("asset-a", 2).await;
+    // Connection 0 is the active source. Connection 1 is gated so it cannot
+    // win the initial snapshot race, then receives a snapshot after batch 1.
+    sleep(Duration::from_millis(200)).await;
+    assert!(mock.publish_delta("asset-a", Side::Buy, 400_000, 11_000_000));
+    sleep(Duration::from_millis(50)).await;
+    assert!(mock.publish_delta("asset-a", Side::Buy, 400_000, 12_000_000));
+    sleep(Duration::from_millis(100)).await;
+    mock.release_initial(1);
+    sleep(Duration::from_millis(200)).await;
+    assert!(mock.publish_delta("asset-a", Side::Buy, 400_000, 13_000_000));
+    sleep(Duration::from_millis(50)).await;
+    assert!(mock.publish_delta("asset-a", Side::Buy, 400_000, 14_000_000));
+    sleep(Duration::from_millis(200)).await;
+
+    let truth_at_loss = mock.book("asset-a");
+    let previous_next_id = mock.next_id();
+    mock.close_connection(0);
+    mock.wait_for_new_connection(previous_next_id).await;
+    sleep(Duration::from_millis(100)).await;
+
+    assert!(mock.publish_delta("asset-a", Side::Buy, 400_000, 15_000_000));
+    sleep(Duration::from_millis(50)).await;
+    assert!(mock.publish_delta("asset-a", Side::Sell, 600_000, 4_000_000));
+    sleep(Duration::from_millis(300)).await;
+    done.notify_one();
+    let report = finish_collector(handle).await;
+    let capture = read_capture(&output);
+    let updates = mock.delivered_updates_for("asset-a");
+
+    assert_eq!(updates.len(), 6);
+    assert_deltas_match_updates(&capture, &updates, SYMBOL_A);
+    assert_per_symbol_anchor(&capture, SYMBOL_A);
+    assert_delta_receive_times_monotonic(&capture, SYMBOL_A);
+    assert_eq!(
+        recovery_snapshot(&capture, SYMBOL_A),
+        &truth_at_loss,
+        "failover snapshot must contain the shadow's current truth"
+    );
+    assert_eq!(reconstructed_book(&capture, SYMBOL_A), mock.book("asset-a"));
+    let summary = verify_capture(&output);
+    assert!(summary.valid, "verify rejected clean failover: {summary:?}");
+    assert!(report.core.failover_snapshots >= 1);
+    assert!(report.core.source_switches >= 1);
+    assert_eq!(report.core.deltas_emitted, 6);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_outage_recovery_exposes_the_uncovered_interval() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let output = directory.path().join("outage.sbe");
+    let mock = MockExchange::start(vec![market("cond-a", "asset-a")], false).await;
+    mock.set_book("asset-a", &[(400_000, 10_000_000)], &[(600_000, 5_000_000)]);
+    let settings = test_settings(&mock, &output);
+    let done = Arc::new(Notify::new());
+    let handle = spawn_collector(settings, Arc::clone(&done));
+
+    mock.wait_for_connections(2).await;
+    mock.wait_for_subscriptions("asset-a", 2).await;
+    sleep(Duration::from_millis(200)).await;
+    assert!(mock.publish_delta("asset-a", Side::Buy, 400_000, 11_000_000));
+    sleep(Duration::from_millis(50)).await;
+    assert!(mock.publish_delta("asset-a", Side::Sell, 600_000, 4_000_000));
+    sleep(Duration::from_millis(200)).await;
+    let pre_outage = mock.book("asset-a");
+
+    let previous_next_id = mock.next_id();
+    mock.set_suppress_deltas(true);
+    mock.set_reject_connections(true);
+    mock.close_all();
+    sleep(Duration::from_millis(200)).await;
+
+    // These updates occur during the uncovered interval. They change the
+    // authoritative book but are deliberately not delivered.
+    assert!(!mock.publish_delta("asset-a", Side::Buy, 400_000, 20_000_000));
+    assert!(!mock.publish_delta("asset-a", Side::Sell, 600_000, 1_000_000));
+    let truth_after_outage = mock.book("asset-a");
+    assert_ne!(pre_outage, truth_after_outage);
+
+    sleep(Duration::from_millis(700)).await;
+    let recovery_started_us = now_us().expect("wall clock");
+    mock.set_reject_connections(false);
+    mock.set_suppress_deltas(false);
+    mock.wait_for_new_connections(previous_next_id, 2).await;
+    mock.wait_for_subscriptions("asset-a", 2).await;
+    sleep(Duration::from_millis(200)).await;
+
+    assert!(mock.publish_delta("asset-a", Side::Buy, 400_000, 21_000_000));
+    sleep(Duration::from_millis(300)).await;
+    done.notify_one();
+    let report = finish_collector(handle).await;
+    let capture = read_capture(&output);
+    let delivered = mock.delivered_updates_for("asset-a");
+    let all = mock.all_updates_for("asset-a");
+
+    assert_eq!(delivered.len(), 3);
+    assert_eq!(all.len(), 5);
+    assert_deltas_match_updates(&capture, &delivered, SYMBOL_A);
+    assert_per_symbol_anchor(&capture, SYMBOL_A);
+    snapshot_at_or_after_matching(&capture, SYMBOL_A, recovery_started_us, &truth_after_outage);
+    assert_eq!(reconstructed_book(&capture, SYMBOL_A), mock.book("asset-a"));
+
+    // The missed interval is not silently represented as complete: verify
+    // reports the pre-outage deltas disagreeing with the recovery snapshot.
+    let summary = verify_capture(&output);
+    assert!(
+        !summary.valid,
+        "a capture with an uncovered interval must not verify as complete"
+    );
+    assert!(summary.snapshot_mismatches >= 1);
+    assert_eq!(summary.mismatch_samples[0]["symbol"], "polymarket:cond-a:0");
+    assert!(report.core.failover_snapshots >= 1);
+    assert_eq!(report.core.deltas_emitted, 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discovery_churn_retires_and_adds_symbols() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let output = directory.path().join("churn.sbe");
+    let a = market("cond-a", "asset-a");
+    let b = market("cond-b", "asset-b");
+    let c = market("cond-c", "asset-c");
+    let mock = MockExchange::start(vec![a.clone(), b.clone()], false).await;
+    mock.set_book("asset-a", &[(400_000, 10_000_000)], &[(600_000, 5_000_000)]);
+    mock.set_book("asset-b", &[(410_000, 8_000_000)], &[(590_000, 7_000_000)]);
+    mock.set_book("asset-c", &[(420_000, 6_000_000)], &[(580_000, 9_000_000)]);
+    let mut settings = test_settings(&mock, &output);
+    settings.collector.discovery_interval_secs = 1;
+    let done = Arc::new(Notify::new());
+    let handle = spawn_collector(settings, Arc::clone(&done));
+
+    mock.wait_for_connections(2).await;
+    mock.wait_for_subscriptions("asset-a", 2).await;
+    mock.wait_for_subscriptions("asset-b", 2).await;
+    sleep(Duration::from_millis(300)).await;
+    assert!(mock.publish_delta("asset-a", Side::Buy, 400_000, 11_000_000));
+    assert!(mock.publish_delta("asset-b", Side::Sell, 590_000, 6_000_000));
+    sleep(Duration::from_millis(300)).await;
+
+    mock.set_markets(vec![a, c]);
+    mock.wait_for_subscriptions("asset-c", 2).await;
+    sleep(Duration::from_millis(400)).await;
+    assert!(mock.publish_delta("asset-c", Side::Buy, 420_000, 7_000_000));
+    sleep(Duration::from_millis(300)).await;
+    done.notify_one();
+    let report = finish_collector(handle).await;
+    let capture = read_capture(&output);
+
+    let b_messages: Vec<&CapturedMessage> = capture
+        .iter()
+        .filter(|message| message.symbol() == "polymarket:cond-b:0")
+        .collect();
+    let last_b = b_messages.last().expect("asset-b history");
+    let CapturedMessage::Snapshot { book, .. } = last_b else {
+        panic!("asset-b must end with a retirement snapshot");
+    };
+    assert!(book.is_empty(), "retirement snapshot must be empty");
+    let retirement = b_messages
+        .iter()
+        .position(|message| {
+            matches!(
+                message,
+                CapturedMessage::Snapshot { book, .. } if book.is_empty()
+            )
+        })
+        .expect("asset-b must have an empty retirement snapshot");
+    assert!(
+        b_messages[retirement..]
+            .iter()
+            .all(|message| matches!(message, CapturedMessage::Snapshot { .. })),
+        "no delta may follow asset-b's retirement boundary"
+    );
+
+    assert_eq!(
+        first_snapshot(&capture, "polymarket:cond-c:0"),
+        &MockBook {
+            bids: [(420_000, 6_000_000)].into(),
+            asks: [(580_000, 9_000_000)].into(),
+        }
+    );
+    assert_deltas_match_updates(
+        &capture,
+        &mock.delivered_updates_for("asset-c"),
+        "polymarket:cond-c:0",
+    );
+    assert_eq!(
+        reconstructed_book(&capture, "polymarket:cond-a:0"),
+        mock.book("asset-a")
+    );
+    assert_eq!(
+        reconstructed_book(&capture, "polymarket:cond-c:0"),
+        mock.book("asset-c")
+    );
+    assert_eq!(
+        reconstructed_book(&capture, "polymarket:cond-b:0"),
+        MockBook::default()
+    );
+
+    let summary = verify_capture(&output);
+    assert!(
+        summary.valid,
+        "retirement snapshot must not be a verify mismatch: {summary:?}"
+    );
+    assert!(summary.empty_snapshots >= 1);
+    assert_eq!(report.core.removed_symbols, 1);
+    assert_eq!(report.core.added_symbols, 3);
+    assert!(report.core.discovery_rounds >= 2);
+    assert_eq!(report.final_symbols, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn silent_subscription_is_detected_and_repaired() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let output = directory.path().join("silent.sbe");
+    let mock = MockExchange::start(vec![market("cond-a", "asset-a")], false).await;
+    mock.set_book("asset-a", &[(400_000, 10_000_000)], &[(600_000, 5_000_000)]);
+    let mut settings = test_settings(&mock, &output);
+    settings.collector.stale_probe_after_secs = 10;
+    settings.collector.probe_interval_secs = 1;
+    settings.collector.max_probes = 1;
+    let done = Arc::new(Notify::new());
+    let handle = spawn_collector(settings, Arc::clone(&done));
+
+    mock.wait_for_connections(2).await;
+    mock.wait_for_subscriptions("asset-a", 2).await;
+    sleep(Duration::from_millis(200)).await;
+    assert!(mock.publish_delta("asset-a", Side::Buy, 400_000, 11_000_000));
+    assert!(mock.publish_delta("asset-a", Side::Sell, 600_000, 4_000_000));
+    sleep(Duration::from_millis(200)).await;
+    let quiet_truth = mock.book("asset-a");
+
+    let previous_next_id = mock.next_id();
+    mock.set_suppress_deltas(true);
+    let quiet_started = tokio::time::Instant::now();
+    mock.wait_for_new_connection(previous_next_id).await;
+    assert!(
+        quiet_started.elapsed() >= Duration::from_secs(9),
+        "reconnect happened before the stale-probe threshold"
+    );
+    mock.set_suppress_deltas(false);
+    sleep(Duration::from_millis(300)).await;
+
+    assert!(mock.publish_delta("asset-a", Side::Buy, 400_000, 12_000_000));
+    sleep(Duration::from_millis(300)).await;
+    done.notify_one();
+    let report = finish_collector(handle).await;
+    let capture = read_capture(&output);
+    let updates = mock.delivered_updates_for("asset-a");
+
+    assert_deltas_match_updates(&capture, &updates, SYMBOL_A);
+    assert_per_symbol_anchor(&capture, SYMBOL_A);
+    assert_delta_receive_times_monotonic(&capture, SYMBOL_A);
+    assert_eq!(
+        recovery_snapshot(&capture, SYMBOL_A),
+        &quiet_truth,
+        "repair snapshot must contain the unchanged truth"
+    );
+    let summary = verify_capture(&output);
+    assert!(
+        summary.valid,
+        "silent repair should leave a self-consistent capture: {summary:?}"
+    );
+    assert!(report.core.stale_probes >= 1);
+    // Polymarket has no snapshot-request command, so a stale probe makes the
+    // supervisor reconnect that socket and resubscribe for a fresh dump. That
+    // is a source switch/failover even though it does not take the core's
+    // direct reseat path counted by `stale_failovers`.
+    assert!(report.core.source_switches >= 1);
+    assert!(report.core.failover_snapshots >= 1);
+    assert!(report.sources.iter().any(|source| source.reconnects >= 1));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn negative_control_missing_update_is_detected_by_verify() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let output = directory.path().join("negative.sbe");
+    let mock = MockExchange::start(vec![market("cond-a", "asset-a")], false).await;
+    mock.set_book("asset-a", &[(400_000, 10_000_000)], &[(600_000, 5_000_000)]);
+    let settings = test_settings(&mock, &output);
+    let done = Arc::new(Notify::new());
+    let handle = spawn_collector(settings, Arc::clone(&done));
+
+    mock.wait_for_connections(2).await;
+    mock.wait_for_subscriptions("asset-a", 2).await;
+    sleep(Duration::from_millis(200)).await;
+    assert!(mock.publish_delta("asset-a", Side::Buy, 400_000, 11_000_000));
+    assert!(mock.publish_delta("asset-a", Side::Sell, 600_000, 4_000_000));
+    sleep(Duration::from_millis(200)).await;
+    let captured_truth = mock.book("asset-a");
+
+    let previous_next_id = mock.next_id();
+    mock.set_suppress_deltas(true);
+    assert!(!mock.publish_delta("asset-a", Side::Buy, 400_000, 20_000_000));
+    assert!(!mock.publish_delta("asset-a", Side::Sell, 600_000, 1_000_000));
+    let authoritative_truth = mock.book("asset-a");
+    assert_ne!(captured_truth, authoritative_truth);
+    let recovery_started_us = now_us().expect("wall clock");
+    sleep(Duration::from_millis(200)).await;
+
+    // Force a fresh exchange snapshot. The collector's capture is
+    // self-consistent before this point but is now shown to be incomplete.
+    mock.close_all();
+    mock.wait_for_new_connections(previous_next_id, 2).await;
+    mock.set_suppress_deltas(false);
+    mock.wait_for_subscriptions("asset-a", 2).await;
+    sleep(Duration::from_millis(200)).await;
+    assert!(mock.publish_delta("asset-a", Side::Buy, 400_000, 21_000_000));
+    sleep(Duration::from_millis(300)).await;
+    done.notify_one();
+    let report = finish_collector(handle).await;
+    let capture = read_capture(&output);
+    let delivered = mock.delivered_updates_for("asset-a");
+
+    assert_deltas_match_updates(&capture, &delivered, SYMBOL_A);
+    snapshot_at_or_after_matching(
+        &capture,
+        SYMBOL_A,
+        recovery_started_us,
+        &authoritative_truth,
+    );
+    let summary = verify_capture(&output);
+    assert!(
+        !summary.valid,
+        "negative control must fail verification when the missing update is exposed"
+    );
+    assert!(summary.snapshot_mismatches >= 1);
+    assert_eq!(summary.mismatch_samples[0]["symbol"], "polymarket:cond-a:0");
+    assert_eq!(report.core.deltas_emitted, delivered.len() as u64);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mock_subscription_scale_across_shards() {
+    const SYMBOLS: usize = 1_000;
+    const SHARDS: usize = 4;
+    const REPLICAS: usize = 2;
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let output = directory.path().join("scale.sbe");
+    let markets: Vec<MarketSpec> = (0..SYMBOLS)
+        .map(|index| market(&format!("cond-{index:03}"), &format!("asset-{index:03}")))
+        .collect();
+    let mock = MockExchange::start(markets, false).await;
+    for index in 0..SYMBOLS {
+        mock.set_book(
+            &format!("asset-{index:03}"),
+            &[(400_000, 10_000_000)],
+            &[(600_000, 5_000_000)],
+        );
+    }
+    let mut settings = test_settings(&mock, &output);
+    settings.collector.shards = SHARDS;
+    settings.collector.replicas = REPLICAS;
+    let done = Arc::new(Notify::new());
+    let handle = spawn_collector(settings, Arc::clone(&done));
+
+    let connection_count = SHARDS * REPLICAS;
+    let subscription_count = SYMBOLS * REPLICAS;
+    mock.wait_for_connections(connection_count).await;
+    mock.wait_for_total_subscriptions(subscription_count).await;
+    assert_eq!(mock.total_subscriptions(), subscription_count);
+    let max_subscriptions = mock.max_subscriptions_per_connection();
+    sleep(Duration::from_secs(1)).await;
+
+    for index in 0..SYMBOLS {
+        let token = format!("asset-{index:03}");
+        assert!(mock.publish_delta(&token, Side::Buy, 400_000, (11 + index as i64) * 1_000_000));
+    }
+    sleep(Duration::from_secs(1)).await;
+    done.notify_one();
+    let report = finish_collector(handle).await;
+    let capture = read_capture(&output);
+
+    assert_eq!(report.shard_count, SHARDS);
+    assert_eq!(report.replica_count, REPLICAS);
+    assert_eq!(report.discovered_symbols, SYMBOLS);
+    assert_eq!(report.final_symbols, SYMBOLS);
+    assert_eq!(report.core.deltas_emitted, SYMBOLS as u64);
+    assert_eq!(
+        max_subscriptions,
+        SYMBOLS / SHARDS,
+        "each shard replica should carry one shard's symbols"
+    );
+
+    for index in 0..SYMBOLS {
+        let token = format!("asset-{index:03}");
+        let symbol = format!("polymarket:cond-{index:03}:0");
+        assert_eq!(
+            reconstructed_book(&capture, &symbol),
+            mock.book(&token),
+            "final book for {symbol}"
+        );
+        assert_per_symbol_anchor(&capture, &symbol);
+        assert_deltas_match_updates(&capture, &mock.delivered_updates_for(&token), &symbol);
+    }
+
+    let summary = verify_capture(&output);
+    assert!(
+        summary.valid,
+        "scale capture must be self-consistent: {summary:?}"
+    );
+    assert_eq!(summary.symbols, SYMBOLS);
+
+    let subscription_log = mock.subscription_log();
+    for frame in &subscription_log {
+        assert!(
+            (frame.connection as usize) < connection_count,
+            "subscription frame came from an unknown connection: {frame:?}"
+        );
+        assert!(
+            matches!(
+                frame.operation.as_str(),
+                "initial_dump" | "subscribe" | "unsubscribe"
+            ),
+            "unexpected subscription operation: {frame:?}"
+        );
+    }
+    let initial_frames: Vec<_> = subscription_log
+        .into_iter()
+        .filter(|frame| frame.initial)
+        .collect();
+    assert_eq!(initial_frames.len(), connection_count);
+    let initial_connections: BTreeSet<u64> = initial_frames
+        .iter()
+        .map(|frame| frame.connection)
+        .collect();
+    assert_eq!(initial_connections.len(), connection_count);
+    assert!(
+        initial_frames
+            .iter()
+            .all(|frame| frame.assets == SYMBOLS / SHARDS),
+        "each initial dump should contain exactly one shard's symbols: {initial_frames:?}"
+    );
+}

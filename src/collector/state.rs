@@ -1304,13 +1304,52 @@ mod tests {
     }
 
     fn snapshot_event(native: &str, bid: i64, ask: i64, clock: i64) -> ExchangeEvent {
+        snapshot_event_at(native, bid, ask, clock, NOW)
+    }
+
+    fn snapshot_event_at(
+        native: &str,
+        bid: i64,
+        ask: i64,
+        clock: i64,
+        received_at_us: i64,
+    ) -> ExchangeEvent {
         ExchangeEvent::Snapshot {
             native_symbol: native.to_owned(),
             book: book(bid, ask),
             meta: EventMeta {
-                received_at_us: NOW,
-                exchange_ts_us: Some(NOW - 1_000),
+                received_at_us,
+                exchange_ts_us: Some(received_at_us - 1_000),
                 seq: Some(1),
+                clock: Some(clock),
+            },
+        }
+    }
+
+    fn received_at(message: &OutputMessage) -> i64 {
+        match message {
+            OutputMessage::Snapshot(snapshot) => snapshot.received_at.timestamp_micros(),
+            OutputMessage::PriceLevelUpdate(update) => update.backtest_timestamp.timestamp_micros(),
+        }
+    }
+
+    fn delta_event_at(
+        native: &str,
+        side: Side,
+        price: i64,
+        quantity: i64,
+        clock: i64,
+        received_at_us: i64,
+    ) -> ExchangeEvent {
+        ExchangeEvent::LevelChange {
+            native_symbol: native.to_owned(),
+            side,
+            price,
+            change: QuantityChange::Absolute(quantity),
+            meta: EventMeta {
+                received_at_us,
+                exchange_ts_us: Some(received_at_us - 1_000),
+                seq: Some(2),
                 clock: Some(clock),
             },
         }
@@ -1343,7 +1382,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_and_delta_are_emitted() {
+    fn snapshot_anchors_delta_application_in_per_symbol_order() {
         let mut core = core();
         core.apply_discovery(NOW, vec![market("A")]).unwrap();
         core.drain_controls();
@@ -1353,6 +1392,7 @@ mod tests {
             panic!("expected snapshot");
         };
         assert_eq!(snapshot.symbol, "A");
+        assert_eq!(snapshot.received_at.timestamp_micros(), NOW);
         assert_eq!(snapshot.bids[0].price_level, 400_000);
         assert_eq!(snapshot.asks[0].price_level, 600_000);
 
@@ -1377,7 +1417,126 @@ mod tests {
         };
         assert_eq!(update.quantity, 12_000_000);
         assert_eq!(update.price_level, 400_000);
-        assert_eq!(core.stats().deltas_emitted, 1);
+        // The writer must not clamp or rewrite the receive timestamp.
+        assert_eq!(update.backtest_timestamp.timestamp_micros(), NOW + 1);
+
+        // A later delta applies to the state produced by the snapshot plus the
+        // first delta, in processing order, without re-emitting a snapshot.
+        let outputs = core.handle_event(
+            SOURCE_A,
+            ExchangeEvent::LevelChange {
+                native_symbol: "A".to_owned(),
+                side: Side::Buy,
+                price: 400_000,
+                change: QuantityChange::Absolute(9_000_000),
+                meta: EventMeta {
+                    received_at_us: NOW + 2,
+                    exchange_ts_us: Some(NOW + 1),
+                    seq: Some(3),
+                    clock: Some(12),
+                },
+            },
+        );
+        assert_eq!(outputs.len(), 1);
+        let OutputMessage::PriceLevelUpdate(update) = &outputs[0] else {
+            panic!("expected delta");
+        };
+        assert_eq!(update.quantity, 9_000_000);
+        assert_eq!(update.backtest_timestamp.timestamp_micros(), NOW + 2);
+        assert_eq!(core.stats().deltas_emitted, 2);
+        assert_eq!(core.stats().exchange_snapshots, 1);
+    }
+
+    #[test]
+    fn failover_snapshot_anchors_resumed_deltas_and_preserves_receive_times() {
+        let mut core = core();
+        core.apply_discovery(NOW, vec![market("A")]).unwrap();
+        core.drain_controls();
+        let outputs = core.handle_event(SOURCE_A, snapshot_event("A", 400_000, 600_000, 10));
+        assert_eq!(
+            received_at(&outputs[0]),
+            NOW,
+            "initial snapshot must keep the frame receive time"
+        );
+
+        // The shadow applies its own updates without emitting. Its book is
+        // current when the active source is lost.
+        assert!(
+            core.handle_event(
+                SOURCE_B,
+                snapshot_event_at("A", 405_000, 595_000, 11, NOW + 100)
+            )
+            .is_empty()
+        );
+        assert!(
+            core.handle_event(
+                SOURCE_B,
+                delta_event_at("A", Side::Buy, 405_000, 11_000_000, 12, NOW + 200)
+            )
+            .is_empty()
+        );
+
+        assert!(
+            core.handle_status(SourceStatus {
+                source: SOURCE_A,
+                connected: true,
+                ..SourceStatus::new(SOURCE_A)
+            })
+            .is_empty()
+        );
+        let outputs = core.handle_status(SourceStatus {
+            source: SOURCE_A,
+            connected: false,
+            last_frame_us: Some(NOW + 300),
+            ..SourceStatus::new(SOURCE_A)
+        });
+        assert_eq!(outputs.len(), 1);
+        let OutputMessage::Snapshot(snapshot) = &outputs[0] else {
+            panic!("expected failover snapshot");
+        };
+        assert_eq!(snapshot.received_at.timestamp_micros(), NOW + 300);
+        assert_eq!(snapshot.bids[0].price_level, 405_000);
+        assert_eq!(snapshot.bids[0].quantity, 11_000_000);
+
+        let outputs = core.handle_event(
+            SOURCE_B,
+            delta_event_at("A", Side::Sell, 595_000, 4_000_000, 13, NOW + 400),
+        );
+        assert_eq!(outputs.len(), 1);
+        let OutputMessage::PriceLevelUpdate(update) = &outputs[0] else {
+            panic!("expected resumed delta");
+        };
+        assert_eq!(update.backtest_timestamp.timestamp_micros(), NOW + 400);
+        assert_eq!(update.quantity, 4_000_000);
+    }
+
+    #[test]
+    fn cross_symbol_output_order_is_processing_order_and_not_globally_sorted() {
+        let mut core = core();
+        core.apply_discovery(NOW, vec![market("A"), market("B")])
+            .unwrap();
+        core.drain_controls();
+
+        // Source A processes B's older frame after A's newer frame. The core
+        // preserves processing order and each frame's actual receive time.
+        // Global chronological order is intentionally not a contract; this
+        // guards against a writer-level timestamp clamp that would hide the
+        // regression by rewriting evidence.
+        let first = core.handle_event(
+            SOURCE_A,
+            snapshot_event_at("A", 400_000, 600_000, 10, NOW + 20),
+        );
+        let second = core.handle_event(
+            SOURCE_A,
+            snapshot_event_at("B", 410_000, 590_000, 11, NOW + 10),
+        );
+        let first_at = received_at(&first[0]);
+        let second_at = received_at(&second[0]);
+        assert_eq!((first_at, second_at), (NOW + 20, NOW + 10));
+        assert!(
+            first_at > second_at,
+            "the test must demonstrate a cross-symbol timestamp regression"
+        );
     }
 
     #[test]

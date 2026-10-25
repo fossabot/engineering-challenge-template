@@ -106,10 +106,19 @@ pub fn run(input: &Path, chunk_size: &str) -> anyhow::Result<VerifySummary> {
                     snapshot.exchange_timestamp.timestamp_micros(),
                 );
                 let incoming = book_from_snapshot(&snapshot)?;
-                if incoming.is_empty() {
+                let empty = incoming.is_empty();
+                if empty {
                     summary.empty_snapshots = summary.empty_snapshots.saturating_add(1);
                 }
-                if let Some(current) = books.get(&snapshot.symbol)
+                // An empty snapshot is the collector's retirement/empty-book
+                // boundary. It carries no level evidence, so comparing it with
+                // the book rebuilt from earlier deltas would flag every normal
+                // discovery removal and identity change. Count it and use it as
+                // the new anchor instead. This deliberately cannot prove that a
+                // suppressed update which emptied a book was observed; only a
+                // later non-empty snapshot can provide that evidence.
+                if !empty
+                    && let Some(current) = books.get(&snapshot.symbol)
                     && snapshots_seen.contains(&snapshot.symbol)
                     && current != &incoming
                 {
@@ -331,6 +340,19 @@ mod tests {
         assert!(!summary.valid);
         assert_eq!(summary.snapshot_mismatches, 1);
         assert_eq!(summary.mismatch_samples.len(), 1);
+    }
+
+    #[test]
+    fn empty_snapshot_is_a_retirement_boundary_not_a_mismatch() {
+        let (_directory, path) = write_capture(vec![
+            snapshot(1, &[(400_000, 10)], &[(600_000, 20)]),
+            update(2, Side::Buy, 400_000, 15),
+            snapshot(3, &[], &[]),
+        ]);
+        let summary = run(&path, "auto").unwrap();
+        assert!(summary.valid);
+        assert_eq!(summary.snapshot_mismatches, 0);
+        assert_eq!(summary.empty_snapshots, 1);
     }
 
     #[test]
