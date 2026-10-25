@@ -42,6 +42,15 @@ pub struct ReportConfig {
     pub writer_queue: usize,
     pub flush_interval_secs: u64,
     pub output_chunk_size: usize,
+    /// Whether the capture file was fsynced on shutdown.
+    #[serde(default = "default_true")]
+    pub output_sync_on_close: bool,
+}
+
+/// Serde default for [`ReportConfig::output_sync_on_close`]; reports written
+/// before the field existed ran with the collector default, which syncs.
+fn default_true() -> bool {
+    true
 }
 
 impl ReportConfig {
@@ -68,6 +77,7 @@ impl ReportConfig {
             writer_queue: settings.collector.writer_queue,
             flush_interval_secs: settings.collector.flush_interval_secs,
             output_chunk_size: settings.output.chunk_size,
+            output_sync_on_close: settings.output.sync_on_close,
         }
     }
 }
@@ -252,5 +262,37 @@ mod tests {
     #[test]
     fn rejects_stdout_sidecar() {
         assert!(write_json_atomic(Path::new("-"), &serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn report_config_records_the_durability_policy() {
+        let mut settings = Settings::load(None).unwrap();
+        settings.output.sync_on_close = false;
+        let config = ReportConfig::from_settings(&settings, 4);
+        assert!(!config.output_sync_on_close);
+        let decoded: ReportConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert!(!decoded.output_sync_on_close);
+
+        // Reports written before the field existed decode with the collector
+        // default: captures were fsynced on close.
+        let legacy: ReportConfig = serde_json::from_value(serde_json::json!({
+            "exchange": "polymarket",
+            "shard_count": 1,
+            "replica_count": 2,
+            "snapshot_interval_secs": 60,
+            "discovery_interval_secs": 30,
+            "reconnect_after_secs": 1800,
+            "connection_idle_timeout_secs": 45,
+            "stale_probe_after_secs": 120,
+            "probe_interval_secs": 30,
+            "max_probes": 3,
+            "max_markets": 0,
+            "writer_queue": 16384,
+            "flush_interval_secs": 1,
+            "output_chunk_size": 67108864
+        }))
+        .unwrap();
+        assert!(legacy.output_sync_on_close);
     }
 }
