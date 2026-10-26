@@ -291,7 +291,8 @@ moderate, low. The baseline commit `d4ab66d` is unchanged.
 - Live proof: `tests/live_polymarket.rs::resubscribing_an_asset_returns_a_fresh_book`
   ran against the public venue on this branch and passed: cycling a
   subscription produced a fresh authoritative book on the same connection.
-  Both live tests passed in 13.0 s.
+  Both live tests passed locally in 13.0 s and on the GitHub runner in the
+  live workflow run linked below.
 - Verification: unit, protocol, E2E, and live all pass.
 
 ### F2: failover snapshots could predate their content (high)
@@ -419,6 +420,8 @@ moderate, low. The baseline commit `d4ab66d` is unchanged.
 | `cargo test --doc --locked` | Pass: 0 documentation tests |
 | `cargo build --release --locked` | Pass |
 | `RUN_LIVE_TESTS=1 cargo test --test live_polymarket -- --ignored` | Pass: 2/2 against the public venue (discovery/subscribe smoke and the resubscribe probe) |
+| GitHub CI on this branch (`0e5f5cf`): [run 40247492433](https://github.com/kj111422/engineering-challenge-template/actions/runs/40247492433) | Pass: format, lint, tests, doc tests, release build |
+| GitHub live workflow on this branch: [run 40247957482](https://github.com/kj111422/engineering-challenge-template/actions/runs/40247957482) | Pass: 2/2 live tests, including the resubscribe probe |
 
 Wording sweep on this branch: zero matches for historical/grader wording,
 unfinished markers, first-person prose, and intent-adverb/idiom candidates in

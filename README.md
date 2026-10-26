@@ -52,9 +52,12 @@ cargo test --doc --locked
 cargo build --release --locked
 ```
 
-The final local CI-equivalent run has **127 passing offline tests**: 118
-library tests, 7 mock-exchange end-to-end tests, and 2 replay integration tests.
-Exact commands, counts, and the CI status are recorded in
+This branch's most recent run has **139 passing offline tests**: 130 library
+tests, 7 mock-exchange end-to-end tests, and 2 replay integration tests, plus
+2 opt-in live tests. The branch's commands, counts, and CI/live run links are
+recorded in
+[`docs/correctness-audit-2026-10-26.md`](docs/correctness-audit-2026-10-26.md);
+the submitted baseline's 127-test run is recorded in
 [`docs/final-verification-2026-10-25.md`](docs/final-verification-2026-10-25.md).
 
 The offline suite covers decoding, fixed-point arithmetic, order books,
