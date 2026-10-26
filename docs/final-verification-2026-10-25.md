@@ -4,6 +4,11 @@ One local CI-equivalent run of the submitted tree, at the final commit on
 `fork/main`. The test counts quoted in the README come from this run; the
 commit hash and ZIP digest are reported with the submission.
 
+**Scope note:** this record pins the baseline commit `d4ab66d`. Session
+recovery, timestamp, and sharding behavior changed on later development
+branches; their evidence is recorded in
+[`correctness-audit-2026-10-26.md`](correctness-audit-2026-10-26.md).
+
 Environment: macOS (arm64), Rust 1.99.1 pinned by `rust-toolchain.toml`,
 release profile for the binary.
 

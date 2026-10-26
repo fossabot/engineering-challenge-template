@@ -3,8 +3,10 @@
 Test names are exact; the offline suite is run by `cargo test --all-targets --locked`.
 The public-network test is separate and ignored unless `RUN_LIVE_TESTS=1` is set.
 
-The final gate run and its exact counts are recorded in
-[`final-verification-2026-10-25.md`](final-verification-2026-10-25.md).
+Gate evidence for the submitted baseline is recorded in
+[`final-verification-2026-10-25.md`](final-verification-2026-10-25.md);
+this branch's results are recorded in
+[`correctness-audit-2026-10-26.md`](correctness-audit-2026-10-26.md).
 
 ## Mandatory requirements
 
