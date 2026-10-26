@@ -1,0 +1,31 @@
+name: Architecture documentation
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  architecture:
+    name: Traceability and Mermaid validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Test architecture gate itself
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
+      - name: Check architecture/source/test inventories
+        run: python3 scripts/check_architecture.py --check
+
+      - name: Parse Mermaid syntax
+        uses: sgerrand/mermaid-validation-action@31f8eed257dbbbadad3332c83694866903e92b0e # v0.2.0 release commit
+        with:
+          fail-on-warning: true
+          comment-on-pr: false

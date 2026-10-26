@@ -1,3 +1,7 @@
 /target/
 .DS_Store
 captures/
+
+# Python validation scripts
+__pycache__/
+*.py[cod]

@@ -38,6 +38,9 @@ SOURCE_RESPONSIBILITIES = {
     "src/verify.rs": "SBE delta-to-snapshot self-consistency verification",
     "src/writer.rs": "bounded writer queue, dedicated writer thread, SBE sink lifecycle",
     "src/ws.rs": "websocket connection options, source binding and connection experiments",
+    "src/capacity.rs": "startup capacity plan and shard derivation with hard gates",
+    "src/catalog.rs": "versioned discovery checkpoint with checksum, age, and counts",
+    "src/persistence.rs": "latest-wins metadata/catalog background writer",
     "src/collector/mod.rs": "collector core module boundary",
     "src/collector/state.rs": "serialized per-symbol/source state machine, discovery and failover decisions",
     "src/exchange/mod.rs": "Exchange and adapter-independent session factory abstraction",
@@ -72,6 +75,15 @@ REQUIRED_TESTS = {
     "shutdown_drains_saturated_queue_and_joins",
     "finish_failure_on_shutdown_is_reported",
     "negative_control_missing_update_is_detected_by_verify",
+    "explicit_shard_count_must_satisfy_the_per_socket_bound",
+    "automatic_sharding_derives_the_required_count",
+    "round_trips_and_reports_age",
+    "rejects_a_modified_market_list",
+    "writes_metadata_and_catalog_and_reports_success",
+    "catalog_generation_time_is_independent_of_metadata_time",
+    "latest_submission_wins_over_intermediate_versions",
+    "submit_does_not_block_on_a_slow_write",
+    "write_failure_is_reported_and_the_worker_survives",
 }
 
 # Anchors that make the main structural claims falsifiable against code.
@@ -81,9 +93,12 @@ REQUIRED_ANCHORS = {
         "Command::Verify", "Command::Latency", "Command::Discover",
     ],
     "src/coordinator.rs": [
-        "run_with_shutdown", "discover_with_retry", "derive_shard_count",
-        "process_worker_event", "dispatch_controls", "tokio::select!",
-        "core.finalize", "writer.shutdown_with_stats",
+        "run_with_shutdown", "discover_with_retry", "process_worker_event",
+        "dispatch_controls", "tokio::select!", "core.finalize",
+        "writer.shutdown_with_stats",
+    ],
+    "src/capacity.rs": [
+        "derive_shard_count", "pub fn plan", "CapacityPlan",
     ],
     "src/collector/state.rs": [
         "apply_discovery", "handle_event", "handle_snapshot",
