@@ -31,6 +31,18 @@ flush_interval_secs = 1
 max_markets = 20
 duration_secs = 0
 writer_send_timeout_secs = 30
+max_total_connections = 64
+max_initial_subscription_bytes = 1048576
+max_estimated_book_memory_mb = 1024
+max_snapshot_bytes_per_sec = 16777216
+connect_concurrency = 8
+# catalog_path = "captures/polymarket-catalog.json"
+catalog_mode = "off"
+catalog_max_age_secs = 3600
+allow_empty_catalog = false
+readiness_min_anchored_fraction = 0.99
+readiness_max_catalog_age_secs = 3600
+readiness_max_stale_secs = 120
 
 [network]
 tcp_nodelay = true
@@ -48,6 +60,11 @@ chunk_size = 67108864
 metadata_path = "captures/polymarket-markets.json"
 report_path = "captures/polymarket-report.json"
 sync_on_close = true
+overwrite = false
+rotate_bytes = 0
+rotate_secs = 0
+min_free_bytes = 0
+fsync_interval_secs = 0
 
 [metrics]
 listen = "127.0.0.1:9090"

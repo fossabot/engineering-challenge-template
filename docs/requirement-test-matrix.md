@@ -45,6 +45,7 @@ this branch's results are recorded in
 | Output order is processing order, not global timestamp order | `cross_symbol_output_order_is_processing_order_and_not_globally_sorted`; E2E `assert_per_symbol_anchor` | Per-symbol snapshots anchor subsequent deltas. Cross-symbol timestamps may regress; consumers must preserve file order. |
 | `verify` handles retirement/empty books without false mismatches | `verify::tests::empty_snapshot_is_a_retirement_boundary_not_a_mismatch` | An empty snapshot is counted as a boundary, not compared level-by-level. It cannot prove a suppressed update that emptied a book was observed; only a later non-empty snapshot can. |
 | Subscription scale is tested beyond discovery | E2E `mock_subscription_scale_across_shards` | 1,000 symbols, 4 shards, 2 replicas, 8 loopback WebSockets, 250 symbols per socket, 2,000 subscription entries. It does not establish live venue limits or 548,942 simultaneous subscriptions. |
+| Scale envelope measured at 1k/5k/25k/100k symbols | E2E `opt_in_scale_run` (ignored; run with `SCALE_SYMBOLS=N`) | Measured connect+subscribe, anchor, settle times, RSS, output bytes. 100k: 20 shards, 40 connections, 200k subscriptions, 5.0s total, 696 MB RSS. Does not establish live venue limits or full-universe 548,942 tokens. |
 
 ## Explicitly not claimed
 

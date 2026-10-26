@@ -9,7 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Semaphore, broadcast, mpsc};
 use tracing::{info, warn};
 
 use crate::{
@@ -104,6 +104,9 @@ pub struct WorkerConfig {
     pub reconnect_after: Duration,
     pub reconnect_base_backoff: Duration,
     pub reconnect_max_backoff: Duration,
+    /// Shared across every worker so the process never exceeds the configured
+    /// number of simultaneous websocket handshakes.
+    pub connect_permits: Arc<Semaphore>,
 }
 
 impl WorkerConfig {
@@ -116,6 +119,7 @@ impl WorkerConfig {
             reconnect_after: Duration::from_secs(settings.reconnect_after_secs),
             reconnect_base_backoff: Duration::from_millis(500),
             reconnect_max_backoff: Duration::from_secs(30),
+            connect_permits: Arc::new(Semaphore::new(settings.connect_concurrency.max(1))),
         }
     }
 }
@@ -156,7 +160,22 @@ pub async fn run_worker(
         let Some(active) = session.as_mut() else {
             break;
         };
-        if let Err(failure) = active.connect().await {
+        let permit = tokio::select! {
+            permit = config.connect_permits.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    close_and_stop(session.take(), &mut status, &events).await;
+                    return;
+                }
+            },
+            _ = shutdown.recv() => {
+                close_and_stop(session.take(), &mut status, &events).await;
+                return;
+            }
+        };
+        let connect_result = active.connect().await;
+        drop(permit);
+        if let Err(failure) = connect_result {
             match failure {
                 SessionFailure::Fatal(error) => {
                     let message = format!("{error:#}");
@@ -618,6 +637,10 @@ fn truncate_error(error: &anyhow::Error) -> String {
 mod tests {
     use super::*;
     use crate::exchange::Exchange as _;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[test]
     fn truncates_errors_on_utf8_boundaries() {
@@ -693,5 +716,113 @@ mod tests {
         let _ = shutdown_tx.send(());
         let stopped = tokio::time::timeout(Duration::from_secs(10), worker).await;
         assert!(stopped.is_ok(), "worker did not stop after shutdown");
+    }
+
+    struct ConnectGauge {
+        current: AtomicUsize,
+        maximum: AtomicUsize,
+    }
+
+    struct GaugeSession {
+        gauge: Arc<ConnectGauge>,
+    }
+
+    #[async_trait]
+    impl MarketDataSession for GaugeSession {
+        async fn connect(&mut self) -> Result<(), SessionFailure> {
+            let current = self.gauge.current.fetch_add(1, Ordering::SeqCst) + 1;
+            self.gauge.maximum.fetch_max(current, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            self.gauge.current.fetch_sub(1, Ordering::SeqCst);
+            Err(SessionFailure::Fatal(anyhow::anyhow!(
+                "connect attempt finished"
+            )))
+        }
+
+        async fn apply_subscriptions(
+            &mut self,
+            _desired: &BTreeSet<String>,
+        ) -> Result<(), SessionFailure> {
+            Ok(())
+        }
+
+        async fn next_frame(&mut self) -> Result<SessionFrame, SessionFailure> {
+            Err(SessionFailure::Fatal(anyhow::anyhow!("unused")))
+        }
+
+        async fn send_keepalive(&mut self) -> Result<(), SessionFailure> {
+            Ok(())
+        }
+
+        async fn request_snapshot(&mut self, _symbols: &[String]) -> Result<(), SessionFailure> {
+            Ok(())
+        }
+
+        async fn close(&mut self) {}
+    }
+
+    struct GaugeFactory {
+        gauge: Arc<ConnectGauge>,
+    }
+
+    #[async_trait]
+    impl SessionFactory for GaugeFactory {
+        async fn create_session(
+            &self,
+            _source: SourceId,
+        ) -> anyhow::Result<Box<dyn MarketDataSession>> {
+            Ok(Box::new(GaugeSession {
+                gauge: Arc::clone(&self.gauge),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_concurrency_is_bounded_across_workers() {
+        let mut settings = crate::config::Settings::load(None).unwrap();
+        settings.collector.connect_concurrency = 2;
+        let gauge = Arc::new(ConnectGauge {
+            current: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let factory: Arc<dyn SessionFactory> = Arc::new(GaugeFactory {
+            gauge: Arc::clone(&gauge),
+        });
+        let config = WorkerConfig::from_settings(&settings.collector);
+        let mut workers = Vec::new();
+        let mut shutdown_senders = Vec::new();
+        for index in 0..8u16 {
+            let (event_tx, mut event_rx) = mpsc::channel(16);
+            let (_command_tx, command_rx) = mpsc::channel(8);
+            let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+            shutdown_senders.push(shutdown_tx);
+            let factory = Arc::clone(&factory);
+            let config = config.clone();
+            workers.push(tokio::spawn(async move {
+                run_worker(
+                    factory,
+                    SourceId::new(0, index),
+                    command_rx,
+                    event_tx,
+                    config,
+                    shutdown_rx,
+                )
+                .await;
+                // Drain until the channel closes so status/fatal sends never
+                // block a worker on a full test channel.
+                while event_rx.recv().await.is_some() {}
+            }));
+        }
+        for worker in workers {
+            tokio::time::timeout(Duration::from_secs(10), worker)
+                .await
+                .expect("worker did not stop")
+                .unwrap();
+        }
+        let maximum = gauge.maximum.load(Ordering::SeqCst);
+        assert_eq!(
+            maximum, 2,
+            "connect concurrency should reach but never exceed the limit"
+        );
     }
 }

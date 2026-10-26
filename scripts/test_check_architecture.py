@@ -17,7 +17,22 @@ class ArchitectureGateTests(unittest.TestCase):
     def test_architecture_has_all_structurally_validated_diagrams(self) -> None:
         document = gate.DOC.read_text(encoding="utf-8")
         self.assertEqual([], gate.check_mermaid_structure(document))
-        self.assertEqual(8, len(gate.MERMAID_RE.findall(document)))
+        self.assertEqual(9, len(gate.MERMAID_RE.findall(document)))
+
+
+    def test_phase2_runtime_paths_are_integrated(self) -> None:
+        self.assertEqual([], gate.module_integration_errors())
+
+    def test_missing_runtime_anchor_is_reported(self) -> None:
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "src").mkdir()
+            for name in ("config.rs", "capacity.rs", "catalog.rs", "coordinator.rs"):
+                (root / "src" / name).write_text("", encoding="utf-8")
+            errors = gate.module_integration_errors(root)
+            self.assertTrue(any("capacity startup" in error for error in errors), errors)
 
     def test_structural_checker_rejects_undeclared_nodes(self) -> None:
         invalid = "```mermaid\nflowchart LR\nA[\"Declared\"] --> B\n```"

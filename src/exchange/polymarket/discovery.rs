@@ -22,7 +22,12 @@ use tokio::time::sleep;
 use tracing::{debug, warn};
 use url::Url;
 
-use crate::{fixed::parse_micros, model::MarketInfo, time::parse_rfc3339_us};
+use crate::{
+    exchange::{DiscoveryResult, DiscoveryStats},
+    fixed::parse_micros,
+    model::MarketInfo,
+    time::{now_us, parse_rfc3339_us},
+};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -240,16 +245,26 @@ fn scalar_string(value: &Value) -> Option<String> {
 /// every record on a non-empty page fails, the response is untrustworthy and
 /// an error is returned so the round is retried instead of silently
 /// reconciling a partial set.
+///
+/// `max_markets` caps selected venue market records, not outcome tokens. A
+/// selected market contributes its complete outcome set, so the cap only ever
+/// stops between records. Policy-filtered records (closed, archived, not
+/// accepting orders, no order book) are parsed but not selected, and they do
+/// not consume the budget.
 fn convert_page(
     page: Vec<RawMarket>,
     require_accepting_orders: bool,
     max_markets: usize,
+    selected_records: &mut usize,
     markets: &mut Vec<MarketInfo>,
     skipped: &mut u64,
 ) -> anyhow::Result<()> {
     let mut converted = 0usize;
     let mut page_skipped = 0usize;
     for raw in page {
+        if max_markets != 0 && *selected_records >= max_markets {
+            break;
+        }
         let infos = match raw.into_markets(require_accepting_orders) {
             Ok(infos) => infos,
             Err(error) => {
@@ -259,15 +274,14 @@ fn convert_page(
             }
         };
         converted += 1;
-        for info in infos {
-            markets.push(info);
-            if max_markets != 0 && markets.len() >= max_markets {
-                break;
-            }
+        if infos.is_empty() {
+            // Parsed but filtered by policy; not selected.
+            continue;
         }
-        if max_markets != 0 && markets.len() >= max_markets {
-            break;
-        }
+        // Every outcome of a selected market is kept; the record cap is
+        // never applied inside one market's outcome list.
+        markets.extend(infos);
+        *selected_records += 1;
     }
     *skipped += page_skipped as u64;
     if converted == 0 && page_skipped > 0 {
@@ -283,7 +297,9 @@ impl crate::exchange::polymarket::PolymarketExchange {
     pub(crate) async fn fetch_markets(
         &self,
         max_markets: usize,
-    ) -> anyhow::Result<Vec<MarketInfo>> {
+    ) -> anyhow::Result<DiscoveryResult> {
+        let started = std::time::Instant::now();
+        let started_at_us = now_us().unwrap_or(0);
         let base = self.settings().gamma_url.trim_end_matches('/').to_owned();
         // Gamma's keyset endpoint rejects more than 100 records per page with
         // HTTP 422. The configuration validator enforces the same bound; the
@@ -292,15 +308,19 @@ impl crate::exchange::polymarket::PolymarketExchange {
         let mut cursor: Option<String> = None;
         let mut seen_cursors = BTreeSet::new();
         let mut markets = Vec::new();
+        // `max_markets` is a venue-record budget. Outcome tokens are counted
+        // separately because one selected market can contribute several.
+        let mut selected_records = 0usize;
         let mut pages = 0usize;
         let mut skipped = 0u64;
+        let mut retries = 0u64;
         const MAX_DISCOVERY_PAGES: usize = 10_000;
         loop {
             anyhow::ensure!(
                 pages < MAX_DISCOVERY_PAGES,
                 "Polymarket discovery exceeded {MAX_DISCOVERY_PAGES} pages"
             );
-            if max_markets != 0 && markets.len() >= max_markets {
+            if max_markets != 0 && selected_records >= max_markets {
                 break;
             }
             let mut url = keyset_url(&base)?;
@@ -313,7 +333,8 @@ impl crate::exchange::polymarket::PolymarketExchange {
                     query.append_pair("after_cursor", cursor);
                 }
             }
-            let page = self.fetch_page(&url).await?;
+            let (page, page_retries) = self.fetch_page(&url).await?;
+            retries = retries.saturating_add(page_retries);
             pages = pages.saturating_add(1);
             let received = page.markets.len();
             let next_cursor = page.next_cursor.filter(|value| !value.is_empty());
@@ -335,11 +356,17 @@ impl crate::exchange::polymarket::PolymarketExchange {
                 page.markets,
                 self.settings().require_accepting_orders,
                 max_markets,
+                &mut selected_records,
                 &mut markets,
                 &mut skipped,
             )
             .with_context(|| format!("converting Polymarket discovery page {pages}"))?;
-            if max_markets != 0 && markets.len() >= max_markets {
+            debug!(
+                selected_markets = selected_records,
+                outcome_symbols = markets.len(),
+                "Polymarket discovery selection"
+            );
+            if max_markets != 0 && selected_records >= max_markets {
                 break;
             }
             let Some(next_cursor) = next_cursor else {
@@ -387,10 +414,23 @@ impl crate::exchange::polymarket::PolymarketExchange {
                 "Polymarket discovery skipped malformed market records this round"
             );
         }
-        Ok(markets)
+        let finished_at_us = now_us().unwrap_or(started_at_us);
+        Ok(DiscoveryResult {
+            stats: DiscoveryStats {
+                pages: pages as u64,
+                selected_markets: selected_records as u64,
+                outcome_symbols: markets.len() as u64,
+                malformed_records: skipped,
+                retries,
+                duration_ms: started.elapsed().as_millis() as u64,
+                started_at_us,
+                finished_at_us,
+            },
+            markets,
+        })
     }
 
-    async fn fetch_page(&self, url: &Url) -> anyhow::Result<KeysetPage> {
+    async fn fetch_page(&self, url: &Url) -> anyhow::Result<(KeysetPage, u64)> {
         let mut last_error = None;
         for attempt in 0..5u32 {
             let request = self
@@ -410,9 +450,10 @@ impl crate::exchange::polymarket::PolymarketExchange {
                             .text()
                             .await
                             .context("reading Polymarket discovery response")?;
-                        return serde_json::from_str(&body).with_context(|| {
+                        let page = serde_json::from_str(&body).with_context(|| {
                             format!("decoding Polymarket discovery page from {url}")
-                        });
+                        })?;
+                        return Ok((page, u64::from(attempt)));
                     }
                     let retryable = status.as_u16() == 429
                         || status.as_u16() == 408
@@ -647,18 +688,131 @@ mod tests {
         valid.condition_id = Some("0xvalid".to_owned());
         let mut malformed = raw();
         malformed.condition_id = None;
+        let mut selected = 0usize;
         let mut markets = Vec::new();
         let mut skipped = 0u64;
-        convert_page(vec![malformed, valid], true, 0, &mut markets, &mut skipped).unwrap();
+        convert_page(
+            vec![malformed, valid],
+            true,
+            0,
+            &mut selected,
+            &mut markets,
+            &mut skipped,
+        )
+        .unwrap();
         assert_eq!(markets.len(), 2);
+        assert_eq!(selected, 1);
         assert_eq!(skipped, 1);
         assert_eq!(markets[0].symbol, "polymarket:0xvalid:0");
+    }
+
+    #[test]
+    fn market_cap_counts_records_and_keeps_each_outcome_set() {
+        let mut first = raw();
+        first.condition_id = Some("0xfirst".to_owned());
+        let mut second = raw();
+        second.condition_id = Some("0xsecond".to_owned());
+        let mut selected = 0usize;
+        let mut markets = Vec::new();
+        let mut skipped = 0u64;
+
+        convert_page(
+            vec![first.clone(), second.clone()],
+            true,
+            1,
+            &mut selected,
+            &mut markets,
+            &mut skipped,
+        )
+        .unwrap();
+
+        // One selected Gamma record, both of its outcome tokens preserved.
+        assert_eq!(selected, 1);
+        assert_eq!(markets.len(), 2);
+        assert!(
+            markets
+                .iter()
+                .all(|market| market.symbol.starts_with("polymarket:0xfirst:"))
+        );
+        assert_eq!(skipped, 0);
+
+        // The cap stops between records, never inside an outcome list.
+        let mut next_page = Vec::new();
+        let mut next_selected = selected;
+        convert_page(
+            vec![second],
+            true,
+            1,
+            &mut next_selected,
+            &mut next_page,
+            &mut skipped,
+        )
+        .unwrap();
+        assert_eq!(next_selected, 1);
+        assert!(next_page.is_empty());
+    }
+
+    #[test]
+    fn filtered_and_malformed_records_do_not_consume_the_market_budget() {
+        let mut filtered = raw();
+        filtered.closed = Some(true);
+        let mut malformed = raw();
+        malformed.condition_id = None;
+        let mut valid = raw();
+        valid.condition_id = Some("0xvalid".to_owned());
+        let mut selected = 0usize;
+        let mut markets = Vec::new();
+        let mut skipped = 0u64;
+
+        convert_page(
+            vec![filtered, malformed, valid],
+            true,
+            1,
+            &mut selected,
+            &mut markets,
+            &mut skipped,
+        )
+        .unwrap();
+
+        assert_eq!(selected, 1);
+        assert_eq!(markets.len(), 2);
+        assert_eq!(skipped, 1);
+        assert!(
+            markets
+                .iter()
+                .all(|market| market.symbol.starts_with("polymarket:0xvalid:"))
+        );
+    }
+
+    #[test]
+    fn zero_market_cap_selects_every_eligible_record() {
+        let mut first = raw();
+        first.condition_id = Some("0xa".to_owned());
+        let mut second = raw();
+        second.condition_id = Some("0xb".to_owned());
+        let mut selected = 0usize;
+        let mut markets = Vec::new();
+        let mut skipped = 0u64;
+
+        convert_page(
+            vec![first, second],
+            true,
+            0,
+            &mut selected,
+            &mut markets,
+            &mut skipped,
+        )
+        .unwrap();
+
+        assert_eq!(selected, 2);
+        assert_eq!(markets.len(), 4);
     }
 
     #[test]
     fn a_page_of_only_malformed_records_fails_the_round() {
         let mut markets = Vec::new();
         let mut skipped = 0u64;
+        let mut selected = 0usize;
         let mut malformed_a = raw();
         malformed_a.condition_id = None;
         let mut malformed_b = raw();
@@ -667,10 +821,12 @@ mod tests {
             vec![malformed_a, malformed_b],
             true,
             0,
+            &mut selected,
             &mut markets,
             &mut skipped,
         )
         .unwrap_err();
+        assert_eq!(selected, 0);
         assert!(
             error.to_string().contains("failed to decode"),
             "unexpected error: {error:#}"
@@ -791,8 +947,12 @@ mod tests {
                 .await
                 .expect("keyset pagination timed out")
                 .unwrap();
+        assert_eq!(markets.stats.pages, 2);
+        assert_eq!(markets.stats.selected_markets, 3);
+        assert_eq!(markets.stats.outcome_symbols, 3);
         assert_eq!(
             markets
+                .markets
                 .iter()
                 .map(|market| market.native_symbol.as_str())
                 .collect::<Vec<_>>(),
@@ -831,5 +991,47 @@ mod tests {
             error.to_string().contains("repeated next_cursor"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn retries_408_and_honors_retry_after() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(0usize));
+        let observed = Arc::clone(&requests);
+        tokio::spawn(async move {
+            for response in [
+                "HTTP/1.1 408 Request Timeout\r\nRetry-After: 0\r\nContent-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+                    .to_owned(),
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    json!({"markets": [one_outcome_market("0xaaa", "111")]})
+                        .to_string()
+                        .len(),
+                    json!({"markets": [one_outcome_market("0xaaa", "111")]})
+                ),
+            ] {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = [0u8; 4096];
+                let _ = socket.read(&mut buffer).await;
+                *observed.lock().await += 1;
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        let exchange = exchange_for(address);
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), exchange.fetch_markets(0))
+                .await
+                .expect("408 retry timed out")
+                .unwrap();
+        assert_eq!(result.stats.retries, 1);
+        assert_eq!(result.stats.pages, 1);
+        assert_eq!(result.stats.selected_markets, 1);
+        assert_eq!(*requests.lock().await, 2);
     }
 }

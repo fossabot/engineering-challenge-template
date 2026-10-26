@@ -28,10 +28,10 @@ The collector enforces hard startup gates via [`capacity::plan`](../src/capacity
 | Limit | Formula | Default | Rationale |
 |-------|---------|---------|-----------|
 | `max_symbols_per_socket` | `symbols / shards` | 5,000 | Polymarket WebSocket frame size limits; empirical stability ceiling. |
-| `max_total_connections` | `shards × replicas` | 512 | File descriptor and TCP connection table pressure. |
+| `max_total_connections` | `shards × replicas` | 64 | Built-in planning default; deployment overrides must be stated separately. |
 | `max_initial_subscription_bytes` | `overhead + max_symbols_per_socket × (longest_symbol + 3)` | 1 MiB | Initial `market` subscribe frame must fit in one WebSocket message. |
-| `max_estimated_book_memory_mb` | `outcome_symbols × 4096 bytes` | 4 GiB | RSS cap for in-memory order books (bids + asks per symbol). |
-| `max_snapshot_bytes_per_sec` | `outcome_symbols × snapshot_size / snapshot_interval` | 64 MiB/s | Periodic snapshot write bandwidth. |
+| `max_estimated_book_memory_mb` | `outcome_symbols × 4096 bytes` | 1 GiB | Planning estimate, not an RSS ceiling: book level maps are unbounded. |
+| `max_snapshot_bytes_per_sec` | `outcome_symbols × snapshot_size / snapshot_interval` | 16 MiB/s | Planning estimate for periodic snapshot bandwidth. |
 | `max_shards` | — | 64 | Coordinator task sprawl; each shard adds a `tick()` iteration. |
 
 ### Derived Shard Count
@@ -70,8 +70,8 @@ error: derived shard count 110 exceeds max_shards 64
 
 1. Increase `max_shards` to ≥ 110 (requires coordinator scalability validation).
 2. Increase `max_total_connections` to ≥ 220 (requires FD limit validation).
-3. Validate `max_estimated_book_memory_mb` ≥ 2.2 GiB (548,942 × 4 KiB).
-4. Validate `max_snapshot_bytes_per_sec` ≥ 360 MiB/s (548,942 × ~1.2 KiB / 60s).
+3. Validate a deployment override for `max_estimated_book_memory_mb` ≥ 2.2 GiB (548,942 × 4 KiB planning estimate).
+4. Validate a deployment override for `max_snapshot_bytes_per_sec` ≥ 74.9 MB/s (548,942 × 8 KiB / 60s planning estimate).
 5. Run 24-hour soak at full scale with fault injection (unexecuted gate).
 
 Until these are measured, the collector **must not claim production readiness for full-universe collection**.

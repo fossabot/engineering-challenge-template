@@ -33,6 +33,22 @@ flush_interval_secs = 1
 max_markets = 0
 duration_secs = 0
 writer_send_timeout_secs = 30
+# Hard startup gates. The capacity plan is rejected before any socket opens
+# when these are exceeded. max_markets counts venue records, not outcome
+# tokens.
+max_total_connections = 64
+max_initial_subscription_bytes = 1048576
+max_estimated_book_memory_mb = 1024
+max_snapshot_bytes_per_sec = 16777216
+connect_concurrency = 8
+# Last-known-good discovery checkpoint. Modes: off, warm, require, stale.
+# catalog_path = "captures/kalshi-catalog.json"
+catalog_mode = "off"
+catalog_max_age_secs = 3600
+allow_empty_catalog = false
+readiness_min_anchored_fraction = 0.99
+readiness_max_catalog_age_secs = 3600
+readiness_max_stale_secs = 120
 
 [network]
 # Transport controls for every websocket connection. TCP_NODELAY is enabled by
@@ -57,6 +73,19 @@ chunk_size = 67108864
 metadata_path = "captures/kalshi-markets.json"
 report_path = "captures/kalshi-report.json"
 sync_on_close = true
+# Existing capture, sidecar, catalog, manifest, and segment files are startup
+# errors unless this is true.
+overwrite = false
+# Rotation writes <path>.<sequence>.sbe segments, a checksummed manifest, and
+# an atomic rename per segment. Zero disables size or time rotation.
+rotate_bytes = 0
+rotate_secs = 0
+# Stop before the output filesystem falls below this many free bytes. The
+# watermark is checked at most once every five seconds. Zero disables it.
+min_free_bytes = 0
+# Periodic fsync of the active capture or segment. Zero syncs only on
+# rotation and shutdown.
+fsync_interval_secs = 0
 
 [metrics]
 listen = "127.0.0.1:9090"

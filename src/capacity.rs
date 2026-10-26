@@ -139,6 +139,31 @@ pub fn plan(settings: &Settings, markets: &[MarketInfo]) -> anyhow::Result<Capac
     })
 }
 
+/// Validate a refresh against the already-running topology. Unlike [`plan`],
+/// this never derives a new shard count: workers and sockets already exist.
+pub fn plan_fixed_topology(
+    settings: &Settings,
+    markets: &[MarketInfo],
+    shard_loads: &[usize],
+) -> anyhow::Result<CapacityPlan> {
+    anyhow::ensure!(!shard_loads.is_empty(), "collector has no running shards");
+    let shards = shard_loads.len();
+    let max_load = shard_loads.iter().copied().max().unwrap_or(0);
+    anyhow::ensure!(
+        max_load <= settings.collector.max_symbols_per_socket,
+        "projected shard load is {max_load} symbols, above max_symbols_per_socket = {}; refresh rejected without changing subscriptions",
+        settings.collector.max_symbols_per_socket
+    );
+    let mut fixed = settings.clone();
+    fixed.collector.shards = shards;
+    let plan = plan(&fixed, markets)?;
+    anyhow::ensure!(
+        plan.shards == shards,
+        "refresh would require a topology change"
+    );
+    Ok(plan)
+}
+
 /// Count distinct venue market records represented by the selected symbols.
 ///
 /// Polymarket repeats one `exchange_market_id` for every outcome token; Kalshi
@@ -235,6 +260,15 @@ mod tests {
             error.to_string().contains("max_symbols_per_socket"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn fixed_topology_uses_actual_maximum_shard_load() {
+        let mut configured = settings(2, 3, 64);
+        configured.collector.max_total_connections = 4;
+        assert!(plan_fixed_topology(&configured, &markets(5), &[3, 2]).is_ok());
+        let error = plan_fixed_topology(&configured, &markets(5), &[4, 1]).unwrap_err();
+        assert!(error.to_string().contains("projected shard load"));
     }
 
     #[test]

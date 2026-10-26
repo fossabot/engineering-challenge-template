@@ -14,10 +14,12 @@
 //! stdout to a file produces a capture the template reader can open.
 
 use std::{
-    fs::File,
+    fs::{File, OpenOptions},
     io::{BufWriter, Write},
     path::Path,
 };
+
+use sha2::{Digest, Sha256};
 
 use super::dtos::SbeEncode;
 
@@ -33,21 +35,39 @@ pub struct AlignedSbeWriter<W: Write + Send = File> {
     /// data.
     committed: usize,
     bytes_written: u64,
+    /// Optional SHA-256 over every byte handed to the sink, including chunk
+    /// padding. Enabled for rotated segments so the manifest can detect
+    /// truncation or modification after finalization.
+    checksum: Option<Sha256>,
 }
 
 impl AlignedSbeWriter<BufWriter<File>> {
+    /// Create an aligned [`AlignedSbeWriter`] at a new path.
+    ///
+    /// Creation is exclusive: an existing file is an error. Callers that
+    /// explicitly intend to replace an artifact use [`Self::create`].
+    pub fn create_new(path: impl AsRef<Path>, chunk: usize) -> anyhow::Result<Self> {
+        validate_chunk(chunk)?;
+        let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        Ok(Self::from_file(file, chunk))
+    }
+
     /// Create an aligned [`AlignedSbeWriter`] writing to `path` with `chunk`
-    /// chunk size. Clears the file at `path`, if it exists.
+    /// chunk size, clearing the file at `path` if it exists.
+    ///
+    /// This is the explicit-overwrite constructor. Production startup rejects
+    /// existing artifacts unless the operator enables `output.overwrite`.
     pub fn create(path: impl AsRef<Path>, chunk: usize) -> anyhow::Result<Self> {
         validate_chunk(chunk)?;
         let file = File::create(path)?;
+        Ok(Self::from_file(file, chunk))
+    }
+
+    fn from_file(file: File, chunk: usize) -> Self {
         // The chunk buffer is the alignment unit; the OS write buffer only
         // needs to absorb syscall overhead. Do not double the 64 MiB default.
         let write_buffer = chunk.min(1 << 20);
-        Ok(Self::new(
-            BufWriter::with_capacity(write_buffer, file),
-            chunk,
-        ))
+        Self::new(BufWriter::with_capacity(write_buffer, file), chunk)
     }
 
     /// Finish the final chunk, flush, and persist the file.
@@ -60,6 +80,23 @@ impl AlignedSbeWriter<BufWriter<File>> {
         let file = self.writer.get_ref();
         if file.metadata()?.file_type().is_file() {
             file.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// Flush visible bytes and persist them without closing the chunk.
+    ///
+    /// Periodic durability uses this instead of [`Self::sync_all`]: padding
+    /// the active chunk on every sync would grow the capture by up to one
+    /// chunk per interval. Readers can decode the committed messages; the
+    /// remainder of the chunk stays unwritten until it fills or the file is
+    /// finalized.
+    pub fn sync_data(&mut self) -> anyhow::Result<()> {
+        self.write_uncommitted()?;
+        self.writer.flush()?;
+        let file = self.writer.get_ref();
+        if file.metadata()?.file_type().is_file() {
+            file.sync_data()?;
         }
         Ok(())
     }
@@ -80,7 +117,35 @@ impl<W: Write + Send> AlignedSbeWriter<W> {
             chunk,
             committed: 0,
             bytes_written: 0,
+            checksum: None,
         }
+    }
+
+    /// Start a SHA-256 over all bytes written from this point.
+    ///
+    /// Must be called before the first message so the digest covers the whole
+    /// stream, including padding.
+    pub fn enable_checksum(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.bytes_written == 0 && self.buf.is_empty(),
+            "checksum must be enabled before the first message"
+        );
+        self.checksum = Some(Sha256::new());
+        Ok(())
+    }
+
+    /// Hex SHA-256 of every byte written so far, when checksumming is enabled.
+    #[must_use]
+    pub fn checksum_hex(&self) -> Option<String> {
+        self.checksum.as_ref().map(|hasher| {
+            let digest = hasher.clone().finalize();
+            let mut text = String::with_capacity(digest.len() * 2);
+            for byte in digest {
+                use std::fmt::Write as _;
+                let _ = write!(text, "{byte:02x}");
+            }
+            text
+        })
     }
 
     /// Total bytes handed to the underlying writer, including zero padding.
@@ -138,8 +203,12 @@ impl<W: Write + Send> AlignedSbeWriter<W> {
 
     fn write_uncommitted(&mut self) -> anyhow::Result<()> {
         if self.committed < self.buf.len() {
-            self.writer.write_all(&self.buf[self.committed..])?;
-            self.bytes_written += (self.buf.len() - self.committed) as u64;
+            let bytes = &self.buf[self.committed..];
+            self.writer.write_all(bytes)?;
+            if let Some(checksum) = &mut self.checksum {
+                checksum.update(bytes);
+            }
+            self.bytes_written += bytes.len() as u64;
             self.committed = self.buf.len();
         }
         Ok(())

@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
+    sync::Semaphore,
 };
 use tracing::{debug, warn};
 
@@ -374,16 +375,20 @@ impl MetricsRegistry {
         let max_catalog_age_us =
             i64::try_from(self.policy.max_catalog_age_secs.saturating_mul(1_000_000))
                 .unwrap_or(i64::MAX);
-        let catalog_ok = catalog_age_us.is_some_and(|age| age <= max_catalog_age_us);
+        let catalog_ok = catalog_age_us.is_some_and(|age| age <= max_catalog_age_us)
+            && snapshot.catalog.last_discovery_error.is_none();
         checks.insert(
             "catalog".to_owned(),
             ReadinessCheck {
                 ok: catalog_ok,
                 detail: match catalog_age_us {
-                    Some(age) => format!(
+                    Some(age) if snapshot.catalog.last_discovery_error.is_none() => format!(
                         "last accepted catalog round was {} seconds ago (limit {})",
-                        age / 1_000_000,
-                        self.policy.max_catalog_age_secs
+                        age / 1_000_000, self.policy.max_catalog_age_secs
+                    ),
+                    Some(age) => format!(
+                        "last discovery failed ({:?}); last accepted catalog round was {} seconds ago",
+                        snapshot.catalog.last_discovery_error, age / 1_000_000
                     ),
                     None => "no accepted catalog round".to_owned(),
                 },
@@ -807,16 +812,28 @@ pub async fn run_server_on(
     registry: MetricsRegistry,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) -> anyhow::Result<()> {
+    const MAX_METRICS_CLIENTS: usize = 128;
     debug!(address = %listener.local_addr()?, "metrics server listening");
+    let client_slots = Arc::new(Semaphore::new(MAX_METRICS_CLIENTS));
     loop {
         tokio::select! {
             _ = shutdown.recv() => break,
             accepted = listener.accept() => {
-                let Ok((mut socket, peer)) = accepted else {
+                let (mut socket, peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        warn!(%error, "metrics accept failed; retrying after backoff");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
+                let Ok(permit) = Arc::clone(&client_slots).try_acquire_owned() else {
+                    warn!(%peer, "metrics connection limit reached");
                     continue;
                 };
                 let registry = registry.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let mut request = [0u8; 2048];
                     let _ = tokio::time::timeout(Duration::from_secs(2), socket.read(&mut request)).await;
                     let request = String::from_utf8_lossy(&request);

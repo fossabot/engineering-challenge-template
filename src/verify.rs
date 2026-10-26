@@ -305,7 +305,18 @@ mod tests {
     fn write_capture(messages: Vec<OutputMessage>) -> (tempfile::TempDir, PathBuf) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("capture.sbe");
-        let mut writer = DirectWriter::create(path.to_str().unwrap(), 4096, false).unwrap();
+        let mut writer = DirectWriter::create(crate::writer::WriterOptions {
+            path: path.to_str().unwrap().to_owned(),
+            chunk_size: 4096,
+            queue: 16,
+            sync_on_close: false,
+            overwrite: false,
+            rotate_bytes: 0,
+            rotate_secs: 0,
+            min_free_bytes: 0,
+            fsync_interval_secs: 0,
+        })
+        .unwrap();
         for message in messages {
             writer.write(&message).unwrap();
         }

@@ -1,3 +1,5 @@
+pub mod capacity;
+pub mod catalog;
 pub mod collector;
 pub mod config;
 pub mod coordinator;
@@ -8,6 +10,7 @@ pub mod latency;
 pub mod metrics;
 pub mod model;
 pub mod orderbook;
+pub mod persistence;
 pub mod replay;
 pub mod report;
 pub mod session;

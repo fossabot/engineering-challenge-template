@@ -5,7 +5,7 @@
 //! identifiers correspond to each SBE symbol without decoding the binary file.
 
 use std::{
-    fs::File,
+    fs::{File, OpenOptions},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
 };
@@ -14,9 +14,12 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    capacity::CapacityPlan,
     config::{ExchangeKind, Settings},
-    metrics::{CollectorStats, WriterStats},
+    exchange::DiscoveryStats,
+    metrics::{CollectorStats, CoverageStats, WriterStats},
     model::{MarketInfo, SourceStatus},
+    persistence::PersistenceStatus,
     time::now_us,
 };
 
@@ -82,6 +85,24 @@ impl ReportConfig {
     }
 }
 
+/// How the startup subscription set was obtained.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogReport {
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// `cold`, `warm`, or `warm-stale`.
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generated_at_us: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_us: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<String>,
+    pub selected_markets: usize,
+    pub outcome_symbols: usize,
+}
+
 /// Machine-readable summary written at the end of a live or replay run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunReport {
@@ -103,6 +124,24 @@ pub struct RunReport {
     pub writer: WriterStats,
     pub sources: Vec<SourceStatus>,
     pub config: ReportConfig,
+    /// Startup capacity plan for a live run. Replay reports do not have one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<CapacityPlan>,
+    /// Most recent complete discovery round.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<DiscoveryStats>,
+    /// Startup catalog source and checkpoint identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<CatalogReport>,
+    /// Final metadata/catalog persistence result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistence: Option<PersistenceStatus>,
+    /// Final coverage gauges at shutdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<CoverageStats>,
+    /// Rotation manifest when the run wrote multiple segments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_manifest: Option<String>,
 }
 
 impl RunReport {
@@ -144,6 +183,12 @@ impl RunReport {
             writer,
             sources,
             config,
+            capacity: None,
+            discovery: None,
+            catalog: None,
+            persistence: None,
+            coverage: None,
+            output_manifest: None,
         }
     }
 
@@ -165,9 +210,14 @@ pub struct MarketMetadata {
 impl MarketMetadata {
     #[must_use]
     pub fn new(exchange: &str, markets: Vec<MarketInfo>) -> Self {
+        Self::new_at(exchange, markets, now_us().unwrap_or(0))
+    }
+
+    #[must_use]
+    pub fn new_at(exchange: &str, markets: Vec<MarketInfo>, generated_at_us: i64) -> Self {
         Self {
             schema_version: REPORT_SCHEMA_VERSION,
-            generated_at_us: now_us().unwrap_or(0),
+            generated_at_us,
             exchange: exchange.to_owned(),
             count: markets.len(),
             markets,
@@ -182,6 +232,27 @@ impl MarketMetadata {
 /// Write JSON through a sibling temporary file and rename it into place. This
 /// avoids exposing a truncated report if the process dies mid-write.
 pub fn write_json_atomic<T: Serialize + ?Sized>(path: &Path, value: &T) -> anyhow::Result<()> {
+    let bytes = serialize_json_pretty(path, value)?;
+    write_bytes_atomic(path, &bytes)
+}
+
+/// Pretty JSON with a trailing newline, ready for [`write_bytes_atomic`].
+pub fn serialize_json_pretty<T: Serialize + ?Sized>(
+    path: &Path,
+    value: &T,
+) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(value)
+        .with_context(|| format!("serializing sidecar `{}`", path.display()))?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Write bytes through an exclusively-created sibling temporary file, fsync,
+/// rename, and (on Unix) fsync the parent directory.
+///
+/// The temporary file is removed on every failure path, so a failed write
+/// leaves neither a truncated destination nor a stale temporary behind.
+pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if path.as_os_str() == "-" {
         anyhow::bail!("JSON sidecar path must be a file, not stdout");
     }
@@ -195,28 +266,66 @@ pub fn write_json_atomic<T: Serialize + ?Sized>(path: &Path, value: &T) -> anyho
         .file_name()
         .and_then(|name| name.to_str())
         .context("sidecar path has no file name")?;
-    let temporary = path.with_file_name(format!(
-        ".{file_name}.tmp.{}.{}",
-        std::process::id(),
-        now_us().unwrap_or(0)
-    ));
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut temporary = None;
+    let mut file = None;
+    for attempt in 0..64u32 {
+        let candidate = parent.join(format!(
+            ".{file_name}.tmp.{}.{}.{}",
+            std::process::id(),
+            now_us().unwrap_or(0),
+            attempt
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(created) => {
+                temporary = Some(candidate);
+                file = Some(created);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("creating temporary sidecar in `{}`", parent.display())
+                });
+            }
+        }
+    }
+    let temporary = temporary.context("exhausted unique temporary sidecar names")?;
+    let file = file.context("temporary sidecar file was not created")?;
     let result = (|| -> anyhow::Result<()> {
-        let file = File::create(&temporary)
-            .with_context(|| format!("creating temporary sidecar `{}`", temporary.display()))?;
         let mut writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(&mut writer, value)
-            .with_context(|| format!("serializing sidecar `{}`", path.display()))?;
-        writer.write_all(b"\n")?;
+        writer.write_all(bytes)?;
         writer.flush()?;
         writer.get_ref().sync_all()?;
         std::fs::rename(&temporary, path)
             .with_context(|| format!("installing sidecar `{}`", path.display()))?;
+        sync_parent_directory(parent)?;
         Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
     result
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> anyhow::Result<()> {
+    File::open(parent)
+        .with_context(|| format!("opening sidecar directory `{}`", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("syncing sidecar directory `{}`", parent.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 /// Best-effort sidecar path resolution. Empty paths are treated as absent.

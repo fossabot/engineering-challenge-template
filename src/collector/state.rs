@@ -202,6 +202,66 @@ impl CollectorCore {
         self.stats.clone()
     }
 
+    /// Preview the exact shard loads that [`Self::apply_discovery`] would
+    /// produce. This is deliberately side-effect free so the coordinator can
+    /// reject an over-capacity discovery round before it retires books,
+    /// dispatches controls, emits snapshots, or persists a checkpoint.
+    pub fn projected_shard_loads(&self, markets: &[MarketInfo]) -> anyhow::Result<Vec<usize>> {
+        let mut desired = BTreeMap::new();
+        let mut output_symbols = BTreeSet::new();
+        for info in markets {
+            info.validate().with_context(|| {
+                format!(
+                    "invalid discovery metadata for `{}` ({})",
+                    info.native_symbol, info.symbol
+                )
+            })?;
+            anyhow::ensure!(
+                output_symbols.insert(info.symbol.clone()),
+                "duplicate output symbol `{}` in discovery result",
+                info.symbol
+            );
+            anyhow::ensure!(
+                desired.insert(info.native_symbol.clone(), info).is_none(),
+                "duplicate native symbol `{}` in discovery result",
+                info.native_symbol
+            );
+        }
+        let mut loads: Vec<usize> = self
+            .shards
+            .iter()
+            .map(|shard| shard.symbols.len())
+            .collect();
+        // Existing identities retain their shard. Remove anything that will
+        // disappear or be reidentified, exactly as apply_discovery does.
+        for (native, state) in &self.markets {
+            if desired
+                .get(native)
+                .is_none_or(|info| info.symbol != state.info.symbol)
+            {
+                loads[state.shard] = loads[state.shard].saturating_sub(1);
+            }
+        }
+        let mut additions: Vec<_> = desired
+            .iter()
+            .filter(|(native, info)| {
+                self.markets
+                    .get(*native)
+                    .is_none_or(|state| state.info.symbol != info.symbol)
+            })
+            .collect();
+        additions.sort_by(|left, right| left.0.cmp(right.0));
+        for _ in additions {
+            let shard = loads
+                .iter()
+                .enumerate()
+                .min_by_key(|(index, load)| (**load, *index))
+                .map_or(0, |(index, _)| index);
+            loads[shard] = loads[shard].saturating_add(1);
+        }
+        Ok(loads)
+    }
+
     #[must_use]
     pub fn statuses(&self) -> &BTreeMap<SourceId, SourceStatus> {
         &self.statuses
@@ -221,6 +281,73 @@ impl CollectorCore {
     #[must_use]
     pub fn symbol_count(&self) -> usize {
         self.markets.len()
+    }
+
+    /// Coverage gauges for readiness.
+    ///
+    /// A symbol is anchored only when an active source has a valid book that
+    /// was established by an exchange snapshot. A subscription command that
+    /// was sent but not answered therefore never counts as anchored. Stale
+    /// symbols are anchored books whose last valid update is older than
+    /// `stale_after_us`.
+    #[must_use]
+    pub fn coverage(&self, now_us: i64, stale_after_us: i64) -> crate::metrics::CoverageStats {
+        let mut anchored = 0u64;
+        let mut stale = 0u64;
+        let mut oldest_anchor_us: Option<i64> = None;
+        for state in self.markets.values() {
+            let Some(book) = state.active_book() else {
+                continue;
+            };
+            anchored = anchored.saturating_add(1);
+            let last = book.last_received_at_us.unwrap_or(0);
+            if now_us.saturating_sub(last) > stale_after_us {
+                stale = stale.saturating_add(1);
+            }
+            oldest_anchor_us = Some(oldest_anchor_us.map_or(last, |oldest| oldest.min(last)));
+        }
+        let expected_subscriptions = self
+            .shards
+            .iter()
+            .map(|shard| shard.symbols.len().saturating_mul(shard.sources.len()))
+            .sum::<usize>() as u64;
+        let subscribed_symbols = self
+            .statuses
+            .values()
+            .filter(|status| status.connected)
+            .map(|status| status.subscriptions as u64)
+            .sum();
+        let shards_with_connected_source = self
+            .shards
+            .iter()
+            .filter(|shard| {
+                shard.sources.iter().any(|source| {
+                    self.statuses
+                        .get(source)
+                        .is_some_and(|status| status.connected)
+                })
+            })
+            .count() as u64;
+        crate::metrics::CoverageStats {
+            expected_symbols: self.markets.len() as u64,
+            anchored_symbols: anchored,
+            stale_symbols: stale,
+            expected_subscriptions,
+            subscribed_symbols,
+            shards_with_connected_source,
+            shards: self.shards.len() as u64,
+            sources_connected: self
+                .statuses
+                .values()
+                .filter(|status| status.connected)
+                .count() as u64,
+            sources_total: self
+                .shards
+                .iter()
+                .map(|shard| shard.sources.len())
+                .sum::<usize>() as u64,
+            oldest_anchor_us,
+        }
     }
 
     pub fn begin_shutdown(&mut self) {
@@ -1382,6 +1509,43 @@ mod tests {
             control,
             Control::SetSubscriptions(symbols) if symbols.len() == 1
         )));
+    }
+
+    #[test]
+    fn coverage_separates_sent_subscriptions_from_anchored_books() {
+        let mut core = core();
+        core.apply_discovery(NOW, vec![market("A"), market("B")])
+            .unwrap();
+        core.drain_controls();
+        for source in [SOURCE_A, SOURCE_B] {
+            let mut status = SourceStatus::new(source);
+            status.connected = true;
+            status.subscriptions = 2;
+            core.handle_status(status, NOW);
+        }
+
+        let coverage = core.coverage(NOW, 1_000_000);
+        assert_eq!(coverage.expected_symbols, 2);
+        assert_eq!(coverage.anchored_symbols, 0);
+        assert_eq!(coverage.expected_subscriptions, 4);
+        assert_eq!(coverage.subscribed_symbols, 4);
+        assert_eq!(coverage.shards_with_connected_source, 1);
+        assert_eq!(coverage.sources_connected, 2);
+        assert_eq!(coverage.sources_total, 2);
+        assert_eq!(coverage.oldest_anchor_us, None);
+
+        let outputs = core.handle_event(SOURCE_A, snapshot_event("A", 400_000, 600_000, 10));
+        assert_eq!(outputs.len(), 1);
+        let coverage = core.coverage(NOW, 1_000_000);
+        assert_eq!(coverage.anchored_symbols, 1);
+        assert_eq!(coverage.stale_symbols, 0);
+        assert_eq!(coverage.oldest_anchor_us, Some(NOW));
+
+        // An anchored book that has not received a valid update within the
+        // freshness window is counted as stale, not silently healthy.
+        let coverage = core.coverage(NOW + 2_000_000, 1_000_000);
+        assert_eq!(coverage.anchored_symbols, 1);
+        assert_eq!(coverage.stale_symbols, 1);
     }
 
     #[test]

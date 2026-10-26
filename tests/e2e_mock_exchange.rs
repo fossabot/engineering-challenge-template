@@ -30,6 +30,7 @@ use engineering_challenge::{
     util::{
         AlignedSbeReader, OrderbookSchema,
         dtos::challenge_orderbook::{AnyMessage, PriceLevelUpdateDomain, SnapshotDomain},
+        sha256_hex,
     },
     verify::{self, VerifySummary},
 };
@@ -95,21 +96,64 @@ fn test_settings(mock: &MockExchange, output: &Path) -> Settings {
 }
 
 fn spawn_collector(settings: Settings, done: Arc<Notify>) -> JoinHandle<anyhow::Result<RunReport>> {
+    spawn_collector_with_limit(settings, done, Duration::from_secs(30))
+}
+
+fn spawn_collector_with_limit(
+    settings: Settings,
+    done: Arc<Notify>,
+    safety: Duration,
+) -> JoinHandle<anyhow::Result<RunReport>> {
     tokio::spawn(coordinator::run_with_shutdown(settings, async move {
         tokio::select! {
             _ = done.notified() => "test scenario complete".to_owned(),
-            _ = sleep(Duration::from_secs(30)) => "test scenario safety timeout".to_owned(),
+            _ = sleep(safety) => "test scenario safety timeout".to_owned(),
         }
     }))
 }
 
 async fn finish_collector(handle: JoinHandle<anyhow::Result<RunReport>>) -> RunReport {
-    match tokio::time::timeout(Duration::from_secs(35), handle).await {
+    finish_collector_with_limit(handle, Duration::from_secs(35)).await
+}
+
+async fn finish_collector_with_limit(
+    handle: JoinHandle<anyhow::Result<RunReport>>,
+    limit: Duration,
+) -> RunReport {
+    match tokio::time::timeout(limit, handle).await {
         Ok(Ok(Ok(report))) => report,
         Ok(Ok(Err(error))) => panic!("collector failed: {error:#}"),
         Ok(Err(error)) => panic!("collector task failed: {error}"),
-        Err(_) => panic!("collector did not stop within 35 seconds"),
+        Err(_) => panic!("collector did not stop within {limit:?}"),
     }
+}
+
+/// Reserve an ephemeral local port for the collector's metrics listener.
+fn unused_local_address() -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binding an ephemeral port");
+    listener
+        .local_addr()
+        .expect("reading the ephemeral address")
+}
+
+/// Read one unlabelled Prometheus counter from the collector's metrics
+/// endpoint. A missing endpoint or metric is not an error: startup and the
+/// one-second metrics refresh both race the first scrape.
+async fn scrape_metric(address: SocketAddr, metric: &str) -> Option<f64> {
+    let mut stream = TcpStream::connect(address).await.ok()?;
+    let request = format!("GET /metrics HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.ok()?;
+    let body = response.split_once("\r\n\r\n")?.1;
+    body.lines().find_map(|line| {
+        let (name, value) = line.split_once(' ')?;
+        if name == metric {
+            value.parse().ok()
+        } else {
+            None
+        }
+    })
 }
 
 async fn wait_until(what: &str, mut predicate: impl FnMut() -> bool) {
@@ -1676,4 +1720,242 @@ async fn mock_subscription_scale_across_shards() {
             .all(|frame| frame.assets == SYMBOLS / SHARDS),
         "each initial dump should contain exactly one shard's symbols: {initial_frames:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rotation_produces_a_complete_manifest_and_readable_segments() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let output = directory.path().join("rotated.sbe");
+    let mock = MockExchange::start(vec![market("cond-rot", "asset-rot")], false).await;
+    mock.set_book(
+        "asset-rot",
+        &[(400_000, 10_000_000)],
+        &[(600_000, 5_000_000)],
+    );
+    let mut settings = test_settings(&mock, &output);
+    settings.output.rotate_bytes = CHUNK_SIZE as u64;
+    let done = Arc::new(Notify::new());
+    let handle = spawn_collector(settings, Arc::clone(&done));
+
+    mock.wait_for_total_subscriptions(2).await;
+    sleep(Duration::from_millis(200)).await;
+    for index in 0..400i64 {
+        assert!(mock.publish_delta("asset-rot", Side::Buy, 400_000, (11 + index) * 1_000_000));
+    }
+    sleep(Duration::from_secs(1)).await;
+    done.notify_one();
+    let report = finish_collector(handle).await;
+
+    let manifest_path = report
+        .output_manifest
+        .as_ref()
+        .expect("rotation must record its manifest");
+    let manifest: Value =
+        serde_json::from_str(&std::fs::read_to_string(manifest_path).expect("reading manifest"))
+            .expect("parsing manifest");
+    assert_eq!(manifest["complete"], true);
+    assert_eq!(manifest["chunk_size"], CHUNK_SIZE);
+    let segments = manifest["segments"].as_array().expect("segment list");
+    assert!(
+        segments.len() >= 2,
+        "expected at least two rotated segments, got {}",
+        segments.len()
+    );
+    assert_eq!(report.writer.segments as usize, segments.len());
+
+    let mut messages = Vec::new();
+    for entry in segments {
+        let file = entry["file"].as_str().expect("segment file name");
+        let path = directory.path().join(file);
+        let bytes = std::fs::read(&path).expect("reading segment");
+        assert_eq!(bytes.len() as u64, entry["bytes"].as_u64().unwrap());
+        assert_eq!(sha256_hex(&bytes), entry["sha256"].as_str().unwrap());
+        assert_eq!(bytes.len() % CHUNK_SIZE, 0, "segments stay chunk-aligned");
+        messages.extend(read_capture(&path));
+    }
+    assert_eq!(
+        reconstructed_book(&messages, "polymarket:cond-rot:0"),
+        mock.book("asset-rot"),
+        "reassembling every segment must reproduce the final book"
+    );
+    for entry in std::fs::read_dir(directory.path()).unwrap().flatten() {
+        assert!(
+            !entry.file_name().to_string_lossy().ends_with(".partial"),
+            "unfinalized segment left behind: {}",
+            entry.path().display()
+        );
+    }
+}
+
+/// Opt-in scale harness. Run one size at a time, for example:
+///
+/// `SCALE_SYMBOLS=5000 SCALE_REPORT=measurements/scale-5000.json \
+///  cargo test --release --test e2e_mock_exchange opt_in_scale_run -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opt-in scale run; set SCALE_SYMBOLS and use --ignored"]
+async fn opt_in_scale_run() {
+    let symbols: usize = std::env::var("SCALE_SYMBOLS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1_000);
+    let shards: usize = std::env::var("SCALE_SHARDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| symbols.div_ceil(5_000).max(1));
+    let replicas: usize = std::env::var("SCALE_REPLICAS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2);
+    let wait_secs: u64 = std::env::var("SCALE_WAIT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(180);
+    let stop_secs: u64 = std::env::var("SCALE_STOP_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(180);
+    let settle_secs: u64 = std::env::var("SCALE_SETTLE_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(30);
+    let report_path = std::env::var("SCALE_REPORT").ok();
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let output = directory.path().join("scale.sbe");
+    let started = std::time::Instant::now();
+    let markets: Vec<MarketSpec> = (0..symbols)
+        .map(|index| market(&format!("cond-{index:06}"), &format!("asset-{index:06}")))
+        .collect();
+    let mock = MockExchange::start(markets, false).await;
+    for index in 0..symbols {
+        mock.set_book(
+            &format!("asset-{index:06}"),
+            &[(400_000, 10_000_000)],
+            &[(600_000, 5_000_000)],
+        );
+    }
+    let mut settings = test_settings(&mock, &output);
+    settings.collector.shards = shards;
+    settings.collector.replicas = replicas;
+    settings.collector.max_symbols_per_socket = 5_000;
+    settings.collector.max_shards = 256;
+    settings.collector.max_total_connections = 512;
+    settings.collector.max_initial_subscription_bytes = 1 << 20;
+    settings.collector.max_estimated_book_memory_mb = 4_096;
+    settings.collector.max_snapshot_bytes_per_sec = 64 << 20;
+    let metrics_address = unused_local_address();
+    settings.metrics.listen = Some(metrics_address);
+    let done = Arc::new(Notify::new());
+    let handle = spawn_collector_with_limit(
+        settings,
+        Arc::clone(&done),
+        Duration::from_secs(stop_secs.saturating_mul(3).max(60)),
+    );
+
+    let connection_count = shards * replicas;
+    let subscription_count = symbols * replicas;
+    let wait = Duration::from_secs(wait_secs);
+    wait_until_for(wait, "scale connections", &mut || {
+        mock.state.connection_count() >= connection_count
+    })
+    .await;
+    wait_until_for(wait, "scale subscriptions", &mut || {
+        mock.state.total_subscriptions() >= subscription_count
+    })
+    .await;
+    let connected_at = started.elapsed();
+    let max_per_socket = mock.state.max_subscriptions_per_connection();
+    println!(
+        "SCALE_PHASE connected symbols={symbols} shards={shards} replicas={replicas} \
+         subscriptions={} elapsed_ms={}",
+        mock.state.total_subscriptions(),
+        connected_at.as_millis()
+    );
+
+    // Wait for the collector to process initial snapshots and anchor all symbols.
+    // At large scale this can take significantly longer than the subscription handshake.
+    let anchor_deadline = std::time::Instant::now() + Duration::from_secs(wait_secs);
+    let mut anchored = 0.0;
+    loop {
+        if let Some(value) = scrape_metric(metrics_address, "collector_symbols_anchored").await {
+            anchored = value;
+            if anchored >= symbols as f64 {
+                break;
+            }
+        }
+        if std::time::Instant::now() >= anchor_deadline {
+            panic!("collector anchored {anchored} of {symbols} symbols before the anchor deadline");
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    println!(
+        "SCALE_PHASE anchored symbols={symbols} elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
+
+    for index in 0..symbols {
+        let token = format!("asset-{index:06}");
+        assert!(mock.publish_delta(&token, Side::Buy, 400_000, (11 + index as i64) * 1_000_000));
+    }
+    sleep(Duration::from_secs(2)).await;
+    // The published deltas can sit behind a large initial-snapshot backlog.
+    // Poll the collector's own counter instead of inferring completion from
+    // output-file size, which can be stable while shadow snapshots are being
+    // processed without producing output.
+    let settle_deadline = std::time::Instant::now() + Duration::from_secs(settle_secs);
+    let mut emitted = 0.0;
+    loop {
+        if let Some(value) = scrape_metric(metrics_address, "collector_deltas_emitted_total").await
+        {
+            emitted = value;
+            if emitted >= symbols as f64 {
+                break;
+            }
+        }
+        if std::time::Instant::now() >= settle_deadline {
+            panic!("collector emitted {emitted} of {symbols} deltas before the settle deadline");
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    println!("SCALE_PHASE settled symbols={symbols} emitted={emitted}");
+    done.notify_one();
+    let report = finish_collector_with_limit(handle, Duration::from_secs(stop_secs)).await;
+    let elapsed = started.elapsed();
+    println!(
+        "SCALE_PHASE stopped symbols={symbols} total_ms={}",
+        elapsed.as_millis()
+    );
+
+    assert_eq!(report.discovered_symbols, symbols);
+    assert_eq!(report.final_symbols, symbols);
+    assert_eq!(report.core.deltas_emitted, symbols as u64);
+    assert_eq!(max_per_socket, symbols / shards);
+
+    let rss_kb = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let evidence = json!({
+        "symbols": symbols,
+        "shards": shards,
+        "replicas": replicas,
+        "connections": connection_count,
+        "subscriptions": subscription_count,
+        "max_subscriptions_per_socket": max_per_socket,
+        "deltas": symbols,
+        "output_bytes": report.writer.bytes,
+        "output_segments": report.writer.segments,
+        "connect_and_subscribe_ms": connected_at.as_millis() as u64,
+        "total_ms": elapsed.as_millis() as u64,
+        "process_rss_kb": rss_kb,
+        "capacity": report.capacity,
+    });
+    println!("SCALE_RESULT {}", serde_json::to_string(&evidence).unwrap());
+    if let Some(path) = report_path {
+        std::fs::write(path, serde_json::to_vec_pretty(&evidence).unwrap())
+            .expect("writing scale evidence");
+    }
 }

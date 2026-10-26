@@ -15,7 +15,7 @@ pub use session::{KalshiExchange, KalshiSessionFactory};
 
 use crate::{
     config::{KalshiSettings, NetworkSettings},
-    exchange::Exchange,
+    exchange::{DiscoveryResult, Exchange},
     model::MarketInfo,
     session::SessionFactory,
 };
@@ -34,6 +34,13 @@ impl Exchange for KalshiExchange {
     }
 
     async fn discover_markets(&self, max_markets: usize) -> anyhow::Result<Vec<MarketInfo>> {
+        Ok(self.fetch_markets(max_markets).await?.markets)
+    }
+
+    async fn discover_markets_with_stats(
+        &self,
+        max_markets: usize,
+    ) -> anyhow::Result<DiscoveryResult> {
         self.fetch_markets(max_markets).await
     }
 

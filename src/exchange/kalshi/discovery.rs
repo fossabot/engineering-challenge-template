@@ -16,10 +16,10 @@ use tracing::{debug, warn};
 use url::Url;
 
 use crate::{
-    exchange::kalshi::KalshiExchange,
+    exchange::{DiscoveryResult, DiscoveryStats, kalshi::KalshiExchange},
     fixed::parse_micros,
     model::{MarketInfo, PriceRange},
-    time::parse_rfc3339_us,
+    time::{now_us, parse_rfc3339_us},
 };
 
 /// Convert one discovery page, isolating malformed records.
@@ -112,7 +112,9 @@ impl KalshiExchange {
     pub(crate) async fn fetch_markets(
         &self,
         max_markets: usize,
-    ) -> anyhow::Result<Vec<MarketInfo>> {
+    ) -> anyhow::Result<DiscoveryResult> {
+        let started = std::time::Instant::now();
+        let started_at_us = now_us().unwrap_or(0);
         let base = Url::parse(&format!(
             "{}/",
             self.settings()
@@ -126,6 +128,7 @@ impl KalshiExchange {
         let mut markets = Vec::new();
         let mut pages = 0usize;
         let mut skipped = 0u64;
+        let mut retries = 0u64;
         loop {
             if max_markets != 0 && markets.len() >= max_markets {
                 break;
@@ -143,7 +146,8 @@ impl KalshiExchange {
                     query.append_pair("cursor", cursor);
                 }
             }
-            let page = self.fetch_page(&url).await?;
+            let (page, page_retries) = self.fetch_page(&url).await?;
+            retries = retries.saturating_add(page_retries);
             pages = pages.saturating_add(1);
             debug!(
                 page = pages,
@@ -186,10 +190,24 @@ impl KalshiExchange {
                 "Kalshi discovery skipped malformed market records this round"
             );
         }
-        Ok(markets)
+        let finished_at_us = now_us().unwrap_or(started_at_us);
+        Ok(DiscoveryResult {
+            stats: DiscoveryStats {
+                pages: pages as u64,
+                // Kalshi publishes one symbol per market record.
+                selected_markets: markets.len() as u64,
+                outcome_symbols: markets.len() as u64,
+                malformed_records: skipped,
+                retries,
+                duration_ms: started.elapsed().as_millis() as u64,
+                started_at_us,
+                finished_at_us,
+            },
+            markets,
+        })
     }
 
-    async fn fetch_page(&self, url: &Url) -> anyhow::Result<MarketsPage> {
+    async fn fetch_page(&self, url: &Url) -> anyhow::Result<(MarketsPage, u64)> {
         let mut last_error = None;
         for attempt in 0..5u32 {
             let mut request = self.client().get(url.clone());
@@ -202,15 +220,22 @@ impl KalshiExchange {
             match request.send().await {
                 Ok(response) => {
                     let status = response.status();
+                    let retry_after = response
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.parse::<u64>().ok());
                     if status.is_success() {
                         let body = response
                             .text()
                             .await
                             .context("reading Kalshi discovery response")?;
-                        return serde_json::from_str(&body)
-                            .with_context(|| format!("decoding Kalshi discovery page from {url}"));
+                        let page = serde_json::from_str(&body).with_context(|| {
+                            format!("decoding Kalshi discovery page from {url}")
+                        })?;
+                        return Ok((page, u64::from(attempt)));
                     }
-                    let retryable = status.as_u16() == 429 || status.is_server_error();
+                    let retryable = retryable_status(status.as_u16());
                     let body = response.text().await.unwrap_or_default();
                     let message = format!(
                         "Kalshi discovery HTTP {}: {}",
@@ -221,18 +246,33 @@ impl KalshiExchange {
                         bail!("{message}");
                     }
                     last_error = Some(message);
+                    sleep(retry_delay(attempt, retry_after)).await;
+                    continue;
                 }
                 Err(error) => {
                     last_error = Some(format!("Kalshi discovery request failed: {error}"));
                 }
             }
-            let backoff = 500u64.saturating_mul(1u64 << attempt.min(4));
-            sleep(std::time::Duration::from_millis(backoff)).await;
+            sleep(retry_delay(attempt, None)).await;
         }
         Err(anyhow::anyhow!(
             "{}",
             last_error.unwrap_or_else(|| "Kalshi discovery failed".to_owned())
         ))
+    }
+}
+
+/// Retry transient discovery responses, including an explicit timeout.
+fn retryable_status(status: u16) -> bool {
+    status == 408 || status == 429 || (500..=599).contains(&status)
+}
+
+/// Honor a server `Retry-After` hint, capped so a hostile or mistaken value
+/// cannot stall a discovery round indefinitely.
+fn retry_delay(attempt: u32, retry_after: Option<u64>) -> std::time::Duration {
+    match retry_after {
+        Some(seconds) => std::time::Duration::from_secs(seconds.min(30)),
+        None => std::time::Duration::from_millis(500u64.saturating_mul(1u64 << attempt.min(4))),
     }
 }
 
@@ -477,5 +517,77 @@ mod tests {
         );
         assert!(markets.is_empty());
         assert_eq!(skipped, 2);
+    }
+
+    #[test]
+    fn retry_policy_covers_timeouts_rate_limits_and_server_errors() {
+        assert!(retryable_status(408));
+        assert!(retryable_status(429));
+        assert!(retryable_status(503));
+        assert!(!retryable_status(400));
+        assert!(!retryable_status(404));
+        assert_eq!(retry_delay(0, Some(2)), std::time::Duration::from_secs(2));
+        assert_eq!(
+            retry_delay(0, Some(600)),
+            std::time::Duration::from_secs(30),
+            "a server hint must not stall discovery indefinitely"
+        );
+        assert_eq!(
+            retry_delay(1, None),
+            std::time::Duration::from_millis(1_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_page_retries_408_and_honors_retry_after() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&requests);
+        tokio::spawn(async move {
+            for response in [
+                "HTTP/1.1 408 Request Timeout\r\nRetry-After: 0\r\nContent-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+                    .to_owned(),
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: 28\r\nConnection: close\r\n\r\n\
+                 {\"markets\":[],\"cursor\":null}"
+                    .to_owned(),
+            ] {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = [0u8; 4096];
+                let _ = socket.read(&mut buffer).await;
+                observed.fetch_add(1, Ordering::SeqCst);
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let exchange = KalshiExchange::new(
+            crate::config::KalshiSettings::default(),
+            crate::config::NetworkSettings::default(),
+            false,
+        )
+        .unwrap();
+        let url = Url::parse(&format!("http://{address}/markets")).unwrap();
+        let (page, retries) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), exchange.fetch_page(&url))
+                .await
+                .expect("408 retry timed out")
+                .unwrap();
+        assert!(page.markets.is_empty());
+        assert_eq!(retries, 1);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 }

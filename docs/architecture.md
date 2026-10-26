@@ -1,8 +1,10 @@
 # End-to-end architecture and traceability
 
-**Architecture contract for the audited implementation:** `phase1/correctness-audit`, commit `8725c213503fb1a1f4adc1b3b3a0854a5dd1ba31` (2026-10-26). This document describes code that exists at that revision. It is not a design for the proposed Phase 2 hardening work. If the active branch moves, regenerate the inventories and review every changed edge before treating this document as current.
+**Snapshot basis:** the uploaded source archive `engineering-challenge-phase2-2026-10-26.zip`, SHA-256 `1a8d6e3d7ba53e3369d3cbac854405d96451dfd4a00a1b274e39b9c17c51188d`. The archive has no `.git` directory, so it cannot be tied to a commit SHA or branch from its contents alone. This document maps that exact archived source tree, not an assumed current remote branch.
 
-This is deliberately a set of linked views rather than one unreadable mega-graph. The arrows describe control or data flow; node labels name the main implementation boundary. Paths and test symbols below make material claims auditable against the repository.
+**Verification status: BLOCKED.** The tree contains integration inconsistencies that prevent these files from being treated as a verified runnable architecture. In particular, `src/metrics.rs` imports `crate::persistence::PersistenceStatus`, while `src/lib.rs` does not declare `persistence`; the coordinator also calls the newer metrics API with the old argument list. The `capacity.rs`, `catalog.rs`, and `persistence.rs` files are present but unreachable from either Rust crate root. The diagrams separate live wiring from these inactive Phase 2 source drafts. The Rust toolchain is unavailable in this review environment, so no `cargo test`, Clippy, or release build is claimed.
+
+This is deliberately a set of linked views rather than one unreadable mega-graph. Arrows describe control or data flow; node labels name the implementation boundary. Source paths, test symbols, crate-root reachability, and known integration blockers make each material claim auditable. “Present in source” does not mean “compiled”, “called at runtime”, or “tested”.
 
 ## 1. System topology — runtime components and boundaries
 
@@ -50,6 +52,20 @@ flowchart LR
 **Ownership rule.** `coordinator.rs` owns the serialized `CollectorCore` and makes the decisions that mutate books and produce outputs. Source workers own their websocket session and exchange-specific protocol state. The writer thread is the only live-collection owner of the SBE sink. Worker tasks do not write SBE directly. This prevents concurrent writes from reordering records outside the coordinator's processing order.
 
 **Data contracts.** Exchange-specific codecs map venue frames to normalized types in `model.rs`: `MarketInfo`, `ExchangeEvent`, `EventMeta`, `SourceId`, `Control`, and `OutputMessage`. `fixed.rs` and `side.rs` supply normalized price/side semantics; `orderbook.rs` implements the normalized book; generated SBE DTOs and the aligned reader/writer adapt the supplied schema.
+
+## 1.1. Phase 2 source-root reachability — active versus unintegrated files
+
+```mermaid
+flowchart LR
+    LibRoot["src/lib.rs: library crate root"] --> Metrics["src/metrics.rs: exported module"]
+    Coord["src/coordinator.rs"] --> Metrics
+    Metrics -->|"unresolved import: crate::persistence::PersistenceStatus"| Persistence["src/persistence.rs: file exists, module not declared"]
+    Catalog["src/catalog.rs: file exists, module not declared"] --> Capacity["src/capacity.rs: file exists, module not declared"]
+    Catalog --> Hash["crate::util::sha256_hex: no definition found"]
+    Capacity --> MissingConfig["CollectorSettings lacks the limits referenced by capacity.rs"]
+```
+
+The active source graph is not internally consistent in this archive. `src/lib.rs` exports neither `capacity`, `catalog`, nor `persistence`. The metrics module has already been changed to depend on `PersistenceStatus`, while the coordinator still uses the old `MetricsRegistry::new(exchange)` and `registry.update(core, writer, sources)` call shapes; the definitions in `metrics.rs` require a readiness policy and a fourth `RuntimeStatus` argument. If the dormant files were simply added to `lib.rs`, further compile errors would remain: `capacity.rs` reads collector limits absent from `config.rs`, and `catalog.rs` references `util::sha256_hex`, for which no definition exists in the supplied `src/` tree. This is an integration gap, not a diagramming choice.
 
 ## 2. Startup and steady-state orchestration
 
@@ -204,7 +220,7 @@ One writer preserves the order in which the coordinator enqueues messages; it do
 
 `inspect` provides an offline SBE view. `verify` checks capture self-consistency by applying deltas and comparing reconstructed books with subsequent snapshots. It is not an oracle for every missed live update: a missed event is detectable only when later observations expose the mismatch.
 
-**Current operational caveats:** a file sink is created through `File::create` in the aligned writer path, which truncates an existing path; output rotation/retention is not implemented in this revision. Protect capture paths operationally until non-destructive output creation and rotation are implemented and tested.
+**Current operational caveats:** a file sink is created through `File::create` in the aligned writer path, which truncates an existing path. `validate_output_paths` rejects path aliases and directories, but it does not protect an already-existing capture from truncation. No writer segment-rotation/retention implementation is wired in this source tree. Metrics code contains rotation/readiness fields, but metric fields alone are not evidence of a corresponding writer lifecycle.
 
 ## 7. Shutdown and fatal-error convergence
 
@@ -247,10 +263,12 @@ flowchart TD
     Verify --> Capture
     Latency --> PublicNet["Public WebSocket endpoint"]
 
-    CI["GitHub Actions CI"] --> Format["cargo fmt check"]
+    CI[".github/workflows/ci.yml"] --> Format["cargo fmt check"]
     CI --> Lint["cargo clippy -D warnings"]
     CI --> Tests["cargo test --all-targets + doc tests"]
     CI --> Build["cargo build --release"]
+    ArchCI[".github/workflows/architecture.yml"] --> ArchTests["architecture gate unit tests + inventory checks"]
+    ArchCI --> Mermaid["pinned Mermaid syntax parser"]
     E2E["Mock-exchange E2E"] --> RealPath["Real coordinator / adapter / session / writer / reader"]
     Live["Opt-in live Polymarket tests"] --> LiveNet
 ```
@@ -277,49 +295,81 @@ The test strategy has separate assurance planes:
 
 The runtime configuration is validated by `Settings::validate`; the important sizing relationship is `symbols_per_socket = ceil(discovered_symbols / shard_count)`, with both `max_symbols_per_socket` and `max_shards` enforced when automatic sharding is selected. Replica count multiplies source sockets: `total_source_connections = shard_count × replicas`. These are admission bounds, not evidence that the remote exchange accepts that many concurrent sockets.
 
-## 10. Implementation-to-evidence map
+## 10. Implementation-to-evidence map and Phase 2 integration status
 
-| Claim | Implementation anchor | Focused evidence | Scope of evidence |
+| Claim | Implementation anchor in this archive | Evidence symbol | Status / limit |
 |---|---|---|---|
-| Startup discovers before workers and rejects an empty set | `src/coordinator.rs`: `run_with_shutdown`, `discover_with_retry`; `src/capacity.rs`: `derive_shard_count` | `explicit_shard_count_must_satisfy_the_per_socket_bound`, `automatic_sharding_derives_the_required_count` | Startup/orchestration behavior in tested settings; not full-universe capacity proof |
-| Capacity gates enforce connection, memory, and rate ceilings at startup | `src/capacity.rs`: `pub fn plan`, `CapacityPlan` | `plan_reports_markets_and_outcomes_separately`, `plan_rejects_each_declared_ceiling`, `plan_is_inclusive_at_each_boundary` | Admission bounds checked preflight; not measured live capacity |
-| Event mutations and output decisions are serialized through the core | `src/coordinator.rs`: `process_worker_event`; `src/collector/state.rs`: `handle_event` | `snapshot_anchors_delta_application_in_per_symbol_order`, `cross_symbol_output_order_is_processing_order_and_not_globally_sorted` | Per-symbol anchors and actual processing order; not global timestamp order |
-| Replica failover requires a safe shadow and emits an anchoring snapshot | `src/collector/state.rs`: `reseat`, `best_backup` | `shadow_replica_takes_over_after_source_loss`, `failover_snapshot_anchors_resumed_deltas_and_preserves_receive_times`, E2E `single_socket_loss_fails_over_and_emits_anchoring_snapshot` | Deterministic shadow behavior; doesn't prove a live feed has delivered every update |
-| Discovery churn keeps symbols and books separated | `src/collector/state.rs`: `apply_discovery`, `remove_market` | `discovery_adds_and_removes_with_controls`, E2E `discovery_churn_retires_and_adds_symbols` | Addition/removal semantics at tested scale |
-| Writer handles saturation and shutdown errors explicitly | `src/writer.rs`: `send`, `shutdown_inner` | `normal_shutdown_drains_and_joins`, `shutdown_drains_saturated_queue_and_joins`, `finish_failure_on_shutdown_is_reported` | Queue/thread durability contract under fault-injection tests; not disk-rotation behavior |
-| Verify detects a missed update when a later snapshot exposes divergence | `src/verify.rs`: `run` | E2E `negative_control_missing_update_is_detected_by_verify` | Self-consistency checking only; cannot detect every suppressed or overwritten event |
-| Catalog checkpoints are versioned, checksummed, and age-tracked | `src/catalog.rs`: `Catalog`, `save`, `load` | `round_trips_and_reports_age`, `rejects_a_modified_market_list`, `rejects_count_mismatch_and_unknown_schema`, `checksum_is_exchange_specific` | Checkpoint integrity at rest; not live discovery freshness |
-| Metadata/catalog persistence is non-blocking with latest-wins semantics | `src/persistence.rs`: `PersistenceHandle`, `worker_loop` | `writes_metadata_and_catalog_and_reports_success`, `catalog_generation_time_is_independent_of_metadata_time`, `latest_submission_wins_over_intermediate_versions`, `submit_does_not_block_on_a_slow_write`, `write_failure_is_reported_and_the_worker_survives` | Coalescing, timestamp preservation, failure isolation; not filesystem durability |
-| Polymarket can be tested with public network access | `src/exchange/polymarket/{discovery,codec,session}.rs` | `tests/live_polymarket.rs` (ignored by default) | Short current public-feed check; not long soak/full-universe capacity |
+| Startup discovers before workers and rejects an empty set | `src/coordinator.rs`: `run_with_shutdown`, `discover_with_retry`, local `derive_shard_count` | `explicit_shard_count_must_satisfy_the_per_socket_bound`, `automatic_sharding_derives_the_required_count` in `src/coordinator.rs` | Source-level behavior and test declarations exist; Rust execution not verified in this environment. |
+| Event mutations and output decisions are serialized through the core | `src/coordinator.rs`: `process_worker_event`; `src/collector/state.rs`: `handle_event` | `snapshot_anchors_delta_application_in_per_symbol_order`, `cross_symbol_output_order_is_processing_order_and_not_globally_sorted` | Per-symbol anchoring and processing-order contract; not global timestamp order. |
+| Replica failover requires a safe shadow and emits an anchoring snapshot | `src/collector/state.rs`: `reseat`, `best_backup` | `shadow_replica_takes_over_after_source_loss`, `failover_snapshot_anchors_resumed_deltas_and_preserves_receive_times`, E2E `single_socket_loss_fails_over_and_emits_anchoring_snapshot` | Deterministic source-level behavior; not proof that a live exchange shadow received every update. |
+| Discovery churn retires and adds symbols | `src/collector/state.rs`: `apply_discovery`, `remove_market`; `src/coordinator.rs` discovery result branch | `discovery_adds_and_removes_with_controls`, E2E `discovery_churn_retires_and_adds_symbols` | On accepted discovery results; unsuccessful or empty results with active symbols preserve the current set. |
+| Writer queue/backpressure and shutdown errors are explicit | `src/writer.rs`: `send`, `shutdown_inner` | `normal_shutdown_drains_and_joins`, `shutdown_drains_saturated_queue_and_joins`, `finish_failure_on_shutdown_is_reported` | Tests are source declarations. Existing-path truncation remains; rotation/retention is absent. |
+| `verify` detects a missed update when a later snapshot exposes divergence | `src/verify.rs`: `run` | E2E `negative_control_missing_update_is_detected_by_verify` | Self-consistency check only; it cannot detect every missing or overwritten event. |
+| Live test exists for the public Polymarket feed | `src/exchange/polymarket/{discovery,codec,session}.rs`; `tests/live_polymarket.rs` | `discovers_and_subscribes_to_public_polymarket_books`, `resubscribing_an_asset_returns_a_fresh_book` | Opt-in network tests; not long soak or full-universe capacity proof. |
+| Startup capacity plan enforces connection, subscription-frame, memory, and snapshot-rate ceilings | `src/capacity.rs` contains a `plan` function | `plan_reports_markets_and_outcomes_separately`, `plan_rejects_each_declared_ceiling`, `plan_is_inclusive_at_each_boundary` are in an unrooted file | **NOT ACTIVE.** `coordinator.rs` does not call `capacity::plan`; `config.rs` lacks the referenced limit fields; these tests are not compiled through `lib.rs`. |
+| Versioned catalog checkpoint can be loaded and checksummed | `src/catalog.rs` contains `Catalog::load` / `Catalog::save` | `round_trips_and_reports_age`, `rejects_a_modified_market_list`, `rejects_count_mismatch_and_unknown_schema`, `checksum_is_exchange_specific` are in an unrooted file | **NOT ACTIVE.** `catalog.rs` is not declared in `lib.rs`, and its imports do not currently resolve. |
+| Background latest-wins persistence writes metadata/catalog | `src/persistence.rs` contains `PersistenceHandle` | `writes_metadata_and_catalog_and_reports_success`, `catalog_generation_time_is_independent_of_metadata_time`, `latest_submission_wins_over_intermediate_versions`, `submit_does_not_block_on_a_slow_write`, `write_failure_is_reported_and_the_worker_survives` are in an unrooted file | **NOT ACTIVE.** `persistence.rs` is not declared in `lib.rs`; `coordinator.rs` still writes metadata synchronously using `MarketMetadata::write`. |
+
+The generated inventories enumerate all source files and test-attributed functions, whether or not their containing module is reachable from a crate root. The inventory therefore includes draft tests that `cargo test` cannot discover until their modules are wired into the crate. Reachability is marked explicitly in both inventory files. A source inventory is not a passing-test report.
+
+## 13. Historical Phase 2 audit (superseded)
+
+The audit text below describes the pre-integration snapshot and is retained only
+as review history. It is not a statement of the current runtime: capacity,
+catalog, and persistence are now crate-root reachable and coordinator-wired.
+The architecture checker verifies those call sites directly. Current validation
+status must come from the final command outputs, not this historical section.
+
+The following source files are present in the tree and declared in `lib.rs`, but their integration into the active coordinator path is blocked by missing dependencies or missing wiring. Their test symbols appear in the static test inventory but are explicitly flagged as **INTEGRATION BLOCKED** and do not constitute passing-test evidence for the active runtime.
+
+| File | Intended role | Blocker |
+|---|---|---|
+| `src/capacity.rs` | Startup capacity plan with hard gates for connections, subscription frames, estimated book memory, snapshot bytes/sec; shard derivation | Declared in `lib.rs` but not called by coordinator; reads `CollectorSettings` fields absent from `config.rs` (`max_total_connections`, `max_initial_subscription_bytes`, `max_estimated_book_memory_mb`, `max_snapshot_bytes_per_sec`). |
+| `src/catalog.rs` | Versioned discovery checkpoint with SHA-256, schema version, counts, generation time; four catalog modes (off/warm/require/stale) | Declared in `lib.rs` but imports `util::sha256_hex` (no such definition in supplied `src/util/`) and `capacity::count_selected_markets`. |
+| `src/persistence.rs` | Latest-wins background writer for metadata/catalog; coalescing, non-blocking, failure handling, timestamp preservation | Declared in `lib.rs` but coordinator writes metadata directly via `MarketMetadata::write`; `PersistenceHandle` not used. |
+
+**Integration order (see audit):**
+1. Reconcile crate roots and APIs; decide whether to complete or remove the three Phase 2 draft modules.
+2. Complete capacity dependencies. Add/validate the intended capacity settings, connect `capacity::plan` after discovery but before output files or source workers are created, and make the plan part of startup logs/reports. Test every ceiling at below/equal/above boundaries through an active Cargo target.
+3. Complete checkpoint dependencies. Provide a stable, tested checksum helper; wire `Catalog` load/save into a documented cold/warm/stale bootstrap policy; reject exchange mismatch, checksum mismatch, unsupported schema, and invalid age before subscribing.
+4. Connect the persistence worker. Publish immutable accepted catalog snapshots after complete discovery rounds, route metadata/catalog writes through `PersistenceHandle`, surface errors and timings into `RuntimeStatus`, and wait for final persistence during bounded shutdown.
+5. Close the readiness loop. Give the coordinator a single typed runtime-status builder that reports book coverage/freshness, last accepted discovery time, catalog age/state, persistence status, writer errors, and fatal state; test HTTP code/body for healthy, starting, degraded, and failed states.
+6. Make output paths safe. Reject existing captures by default or require an explicit overwrite option. If rotation is added, implement segments, manifest/finalization, restart behavior, disk-space/error handling, and reader/verify support before emitting rotation metrics.
+7. Rebuild evidence on the integrated tree. Run `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --all-targets --locked`, `cargo test --doc --locked`, `cargo build --release --locked`, then the opt-in live Polymarket test separately. Update the requirement matrix and dated verification record from those actual results.
+8. Regenerate architecture inventories and validate Mermaid. Run `python3 scripts/check_architecture.py --update` and inspect changes; then require `python3 scripts/check_architecture.py --check` and the pinned Mermaid parser workflow to pass. Do not weaken the gate to make the current source snapshot appear healthy.
 
 The generated inventories are part of this contract:
 
-- [`docs/architecture/source-inventory.md`](architecture/source-inventory.md) lists every Rust source file and its subsystem responsibility.
-- [`docs/architecture/test-inventory.md`](architecture/test-inventory.md) lists every statically declared `#[test]` / `#[tokio::test]` function under `src/` and `tests/`.
-- [`docs/requirement-test-matrix.md`](requirement-test-matrix.md) gives the requirement-specific evidence and explicit non-claims.
+- [`docs/architecture/source-inventory.md`](architecture/source-inventory.md) records each Rust file, responsibility, and crate-root reachability.
+- [`docs/architecture/test-inventory.md`](architecture/test-inventory.md) records each statically declared `#[test]` / `#[tokio::test]` and whether it is reachable from a Cargo test target.
+- [`docs/architecture/phase2-integration-audit-2026-10-26.md`](architecture/phase2-integration-audit-2026-10-26.md) records the current blocker list and required integration order.
+- [`docs/requirement-test-matrix.md`](requirement-test-matrix.md) and the dated verification records provide scope-specific evidence and non-claims; they must be reconciled after this source tree builds.
 
 ## 11. Capacity and production boundary — what this diagram does not imply
 
-The graph documents implementation topology, not a production certification. The current measured/tested envelope is narrower than the maximum discoverable universe:
+The graph documents source-level topology, not a production certification, and this specific archive is not yet build-verified. The current measured/tested envelope recorded in repository artifacts is narrower than the maximum discoverable universe:
 
-1. Full Polymarket keyset discovery was recorded at 548,942 unique tokens in 2,746 pages and 9m52s. That is **discovery evidence**, not simultaneous subscription evidence.
-2. The largest checked-in loopback E2E subscription case covers 1,000 symbols, 4 shards, 2 replicas and 8 sockets (250 symbols per socket). It does not establish live venue limits for 548,942 subscriptions.
-3. At 5,000 symbols/socket, 548,942 symbols require `ceil(548942 / 5000) = 110` shards. The example settings cap `max_shards` at 64; this configuration must fail preflight rather than start beyond the cap. Raising that cap also multiplies sockets by `replicas` and requires a staged handshake/throughput/disk soak before use.
-4. Kalshi's authenticated live handshake is not claimed without authorized credentials.
-5. The file path truncation and no-rotation issues described in §6 remain operational blockers for unattended long-lived capture paths.
+1. Historical full Polymarket keyset discovery was recorded at 548,942 unique tokens in 2,746 pages and 9m52s. That is **discovery evidence**, not simultaneous subscription evidence.
+2. The recorded loopback E2E subscription case covers 1,000 symbols, 4 shards, 2 replicas and 8 sockets (250 symbols per socket). It does not establish live venue limits for 548,942 subscriptions.
+3. With 5,000 symbols/socket, 548,942 symbols require `ceil(548942 / 5000) = 110` shards. The example settings cap `max_shards` at 64. The active `coordinator::derive_shard_count` path should reject an automatic shard count above that cap; no full-universe connection test is evidenced here.
+4. `src/capacity.rs` contains estimates for connection count, initial subscription bytes, book memory, and snapshot rate, but it is **not part of the crate module graph** and its referenced settings are absent from `src/config.rs`. Those estimates are not enforced by the current startup path.
+5. Kalshi's authenticated live handshake is not claimed without authorized credentials.
+6. Existing capture paths can be truncated by `File::create`; output rotation/retention is not implemented in the writer.
+7. `docs/correctness-audit-2026-10-26.md`, `README.md`, generated inventories, and source files must not be combined into one test-count assertion until the commit/source snapshot is reconciled. This archive has no Git metadata; the static inventory finds 159 test-attributed function declarations, 15 of them inside three unrooted source files. This is not a count of passing tests.
 
-Use the Phase 2 production-readiness review for the ordered hardening plan; do not represent future catalog checkpointing, asynchronous sidecar persistence, readiness redesign, output rotation, or connection ramping as already implemented.
+The Phase 2 drafts for capacity, catalog checkpointing, and background persistence should be integrated, compiled, tested, and called by the coordinator before diagrams describe them as runtime architecture. `metrics.rs` also needs to be reconciled with the coordinator's constructor/update calls and the module graph before `/readyz` can be claimed as functioning end to end.
 
 ## 12. Keeping this architecture synchronized
 
 Run locally from repository root:
 
 ```bash
-# After intentionally changing module responsibilities or adding tests:
+# Regenerate static inventories after a reviewed source/test change.
+# It intentionally may exit non-zero if source integration blockers remain.
 python3 scripts/check_architecture.py --update
 
-# Always before commit (CI does the same check):
+# The final read-only gate; this must be green before merge.
 python3 scripts/check_architecture.py --check
 ```
 
-The checker fails when a Rust source file lacks a module responsibility, when any statically declared test is absent from the generated test inventory, when tracked inventories are stale, when a Mermaid graph has undeclared node references, or when required architecture anchors/test claims cannot be found in source. A separate pinned Mermaid validator in GitHub Actions parses the actual Mermaid syntax. Treat any failure as a documentation synchronization failure, not a reason to weaken the gate without review.
+The checker fails when a Rust source file lacks a module responsibility, when a source module is unclassified as reachable/unwired, when active code imports an unrooted module, when a statically declared test is absent from the generated inventory, when tracked inventories are stale, when a Mermaid graph has undeclared node references, or when required architecture anchors/test claims cannot be found in source. A separate pinned Mermaid validator in GitHub Actions parses actual Mermaid syntax. In this archive the structural inventory can be regenerated, but the integration gate must remain red until the `metrics.rs`/`persistence` and coordinator/metrics API mismatches are fixed. Treat any failure as a source or documentation synchronization failure, not a reason to weaken the gate without review.

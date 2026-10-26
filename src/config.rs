@@ -157,13 +157,58 @@ pub struct CollectorSettings {
     pub writer_queue: usize,
     /// Flush cadence for partial SBE chunks.
     pub flush_interval_secs: u64,
-    /// Optional cap on discovered symbols (0 means no cap). Useful for smoke
-    /// tests and latency experiments.
+    /// Cap on selected venue market records (0 means no cap).
+    ///
+    /// One Polymarket Gamma record can contribute several outcome tokens; the
+    /// cap is applied between records, never inside one record's outcome set.
+    /// Kalshi publishes one symbol per market, so the same contract applies.
     pub max_markets: usize,
     /// Optional run duration; 0 means run until SIGINT/SIGTERM.
     pub duration_secs: u64,
     /// Maximum accepted outbound writer backlog before the service fails.
     pub writer_send_timeout_secs: u64,
+    /// Hard ceiling on `shards * replicas` websocket connections.
+    pub max_total_connections: usize,
+    /// Hard ceiling on the estimated bytes of one initial subscription frame.
+    pub max_initial_subscription_bytes: usize,
+    /// Hard ceiling on estimated resident memory for book state, in MiB.
+    pub max_estimated_book_memory_mb: u64,
+    /// Hard ceiling on estimated snapshot output, in bytes per second.
+    pub max_snapshot_bytes_per_sec: u64,
+    /// Maximum concurrent websocket connection attempts.
+    pub connect_concurrency: usize,
+    /// Last-known-good catalog checkpoint. `None` disables persistence.
+    pub catalog_path: Option<PathBuf>,
+    /// Catalog bootstrap policy.
+    pub catalog_mode: CatalogMode,
+    /// Maximum accepted catalog age for `warm` and `require`.
+    pub catalog_max_age_secs: u64,
+    /// Accept a complete discovery round that retires every symbol.
+    pub allow_empty_catalog: bool,
+    /// Minimum anchored-symbol fraction required by `/readyz`.
+    pub readiness_min_anchored_fraction: f64,
+    /// Maximum catalog age required by `/readyz`.
+    pub readiness_max_catalog_age_secs: u64,
+    /// Maximum time since a book's last valid update before `/readyz` fails.
+    pub readiness_max_stale_secs: u64,
+}
+
+/// How a persisted catalog is used during startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum CatalogMode {
+    /// Discover before starting workers; never read a checkpoint.
+    #[default]
+    Off,
+    /// Start from a fresh checkpoint when available, then refresh in the
+    /// background. A missing, stale, or empty checkpoint falls back to
+    /// discovery.
+    Warm,
+    /// Require a valid, fresh checkpoint; fail startup otherwise.
+    Require,
+    /// Require any valid, non-empty checkpoint regardless of age. This is the
+    /// explicit degraded boot mode for a total discovery outage.
+    Stale,
 }
 
 impl Default for CollectorSettings {
@@ -191,6 +236,18 @@ impl Default for CollectorSettings {
             max_markets: 0,
             duration_secs: 0,
             writer_send_timeout_secs: 30,
+            max_total_connections: 64,
+            max_initial_subscription_bytes: 1 << 20,
+            max_estimated_book_memory_mb: 1024,
+            max_snapshot_bytes_per_sec: 16 << 20,
+            connect_concurrency: 8,
+            catalog_path: None,
+            catalog_mode: CatalogMode::Off,
+            catalog_max_age_secs: 3600,
+            allow_empty_catalog: false,
+            readiness_min_anchored_fraction: 0.99,
+            readiness_max_catalog_age_secs: 3600,
+            readiness_max_stale_secs: 120,
         }
     }
 }
@@ -208,6 +265,21 @@ pub struct OutputSettings {
     pub report_path: Option<PathBuf>,
     /// Ask the OS to persist the output file on shutdown.
     pub sync_on_close: bool,
+    /// Truncate and replace existing capture, sidecar, and segment files.
+    ///
+    /// The default is false: an existing artifact is an error, so a restart
+    /// or a mistyped path cannot destroy a previous run's data.
+    pub overwrite: bool,
+    /// Rotate after this many bytes (0 disables size rotation).
+    pub rotate_bytes: u64,
+    /// Rotate after this many seconds (0 disables time rotation).
+    pub rotate_secs: u64,
+    /// Stop before free space on the output filesystem drops below this many
+    /// bytes (0 disables the watermark).
+    pub min_free_bytes: u64,
+    /// Periodically fsync the active segment (0 syncs only on rotation and
+    /// close).
+    pub fsync_interval_secs: u64,
 }
 
 impl Default for OutputSettings {
@@ -221,6 +293,11 @@ impl Default for OutputSettings {
             metadata_path: None,
             report_path: None,
             sync_on_close: true,
+            overwrite: false,
+            rotate_bytes: 0,
+            rotate_secs: 0,
+            min_free_bytes: 512 << 20,
+            fsync_interval_secs: 0,
         }
     }
 }
@@ -408,6 +485,56 @@ impl Settings {
         );
         anyhow::ensure!(self.collector.max_probes >= 1, "max_probes must be >= 1");
         anyhow::ensure!(
+            self.collector.max_total_connections >= self.collector.replicas.max(1),
+            "max_total_connections must be >= replicas"
+        );
+        anyhow::ensure!(
+            self.collector.max_total_connections <= 4096,
+            "max_total_connections must be <= 4096"
+        );
+        anyhow::ensure!(
+            self.collector.max_initial_subscription_bytes >= 1024,
+            "max_initial_subscription_bytes must be >= 1024"
+        );
+        anyhow::ensure!(
+            self.collector.max_estimated_book_memory_mb >= 1,
+            "max_estimated_book_memory_mb must be >= 1"
+        );
+        anyhow::ensure!(
+            self.collector.max_snapshot_bytes_per_sec >= 1024,
+            "max_snapshot_bytes_per_sec must be >= 1024"
+        );
+        anyhow::ensure!(
+            (1..=256).contains(&self.collector.connect_concurrency),
+            "connect_concurrency must be in [1, 256]"
+        );
+        anyhow::ensure!(
+            self.collector.catalog_mode == CatalogMode::Off
+                || self
+                    .collector
+                    .catalog_path
+                    .as_deref()
+                    .is_some_and(|path| !path.as_os_str().is_empty()),
+            "catalog_mode {:?} requires collector.catalog_path",
+            self.collector.catalog_mode
+        );
+        anyhow::ensure!(
+            self.collector.catalog_max_age_secs >= 1,
+            "catalog_max_age_secs must be >= 1"
+        );
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&self.collector.readiness_min_anchored_fraction),
+            "readiness_min_anchored_fraction must be in [0, 1]"
+        );
+        anyhow::ensure!(
+            self.collector.readiness_max_catalog_age_secs >= 1,
+            "readiness_max_catalog_age_secs must be >= 1"
+        );
+        anyhow::ensure!(
+            self.collector.readiness_max_stale_secs >= 1,
+            "readiness_max_stale_secs must be >= 1"
+        );
+        anyhow::ensure!(
             self.collector.writer_queue >= 128,
             "writer_queue must be >= 128"
         );
@@ -438,6 +565,11 @@ impl Settings {
         anyhow::ensure!(
             self.output.chunk_size >= 1024 && self.output.chunk_size.is_power_of_two(),
             "output.chunk_size must be a power of two >= 1024"
+        );
+        anyhow::ensure!(
+            self.output.rotate_bytes == 0
+                || self.output.rotate_bytes >= self.output.chunk_size as u64,
+            "output.rotate_bytes must be 0 or at least one aligned chunk"
         );
         anyhow::ensure!(!self.output.path.is_empty(), "output path is empty");
         validate_output_paths(self)?;
@@ -552,10 +684,17 @@ fn validate_output_paths(settings: &Settings) -> anyhow::Result<()> {
         let output = PathBuf::from(&settings.output.path);
         ensure_not_directory("output.path", &output)?;
         paths.push(("output.path", output));
+        if settings.output.rotate_bytes > 0 || settings.output.rotate_secs > 0 {
+            paths.push((
+                "output manifest",
+                rotation_manifest_path(&settings.output.path),
+            ));
+        }
     }
     for (name, path) in [
         ("metadata_path", settings.output.metadata_path.as_deref()),
         ("report_path", settings.output.report_path.as_deref()),
+        ("catalog_path", settings.collector.catalog_path.as_deref()),
     ] {
         let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) else {
             continue;
@@ -577,6 +716,110 @@ fn validate_output_paths(settings: &Settings) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Manifest path for a rotated capture. Segments are named
+/// `<output>.<sequence>.sbe`, so the manifest sits beside them without
+/// colliding with the unrotated capture path.
+#[must_use]
+pub fn rotation_manifest_path(output_path: &str) -> PathBuf {
+    let path = Path::new(output_path);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("output");
+    path.with_file_name(format!("{name}.manifest.json"))
+}
+
+/// Reject every pre-existing artifact that this run would replace.
+///
+/// This is a startup check, not a configuration-syntax check: discovery,
+/// replay, and latency commands may legitimately share a config while writing
+/// somewhere else. Collection and replay call it before doing any work, so a
+/// failed startup leaves the previous capture and sidecars untouched.
+pub fn preflight_output(settings: &Settings) -> anyhow::Result<()> {
+    if settings.output.overwrite {
+        return Ok(());
+    }
+    let mut artifacts: Vec<(&'static str, PathBuf)> = Vec::new();
+    if settings.output.path != "-" {
+        artifacts.push(("output.path", PathBuf::from(&settings.output.path)));
+        if settings.output.rotate_bytes > 0 || settings.output.rotate_secs > 0 {
+            artifacts.push((
+                "output manifest",
+                rotation_manifest_path(&settings.output.path),
+            ));
+            for segment in rotation_segments(&settings.output.path)? {
+                artifacts.push(("output segment", segment));
+            }
+        }
+    }
+    for (name, path) in [
+        ("metadata_path", settings.output.metadata_path.as_deref()),
+        ("report_path", settings.output.report_path.as_deref()),
+    ] {
+        if let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) {
+            artifacts.push((name, path.to_path_buf()));
+        }
+    }
+    // In warm, require, and stale modes the catalog is an input. Replacing it
+    // after a complete discovery round is the intended behavior, not data
+    // loss. In cold-only mode an existing checkpoint is an output artifact and
+    // follows the same overwrite rule as the capture.
+    if settings.collector.catalog_mode == CatalogMode::Off
+        && let Some(path) = settings
+            .collector
+            .catalog_path
+            .as_deref()
+            .filter(|path| !path.as_os_str().is_empty())
+    {
+        artifacts.push(("catalog_path", path.to_path_buf()));
+    }
+    for (name, path) in artifacts {
+        anyhow::ensure!(
+            !path.exists(),
+            "{name} already exists at `{}`; refusing to replace it. \
+             Set output.overwrite = true to replace existing artifacts",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Existing finalized or partial segments for a rotated capture.
+fn rotation_segments(output_path: &str) -> anyhow::Result<Vec<PathBuf>> {
+    let path = Path::new(output_path);
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+    else {
+        return Ok(Vec::new());
+    };
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let prefix = format!("{name}.");
+    let entries = std::fs::read_dir(parent)
+        .with_context(|| format!("scanning rotation directory `{}`", parent.display()))?;
+    Ok(entries
+        .flatten()
+        .filter_map(|entry| {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_str()?;
+            rotation_artifact_name(&prefix, file_name).then(|| entry.path())
+        })
+        .collect())
+}
+
+fn rotation_artifact_name(prefix: &str, name: &str) -> bool {
+    let stem = name.strip_prefix(prefix).and_then(|value| {
+        value
+            .strip_suffix(".sbe")
+            .or_else(|| value.strip_suffix(".sbe.partial"))
+    });
+    stem.is_some_and(|sequence| {
+        sequence.len() == 6 && sequence.bytes().all(|byte| byte.is_ascii_digit())
+    })
 }
 
 fn ensure_not_directory(name: &str, path: &Path) -> anyhow::Result<()> {
@@ -726,6 +969,68 @@ mod tests {
     }
 
     #[test]
+    fn preflight_preserves_existing_artifacts_until_overwrite_is_explicit() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("capture.sbe");
+        let metadata = directory.path().join("metadata.json");
+        std::fs::write(&output, b"previous capture").unwrap();
+        std::fs::write(&metadata, b"previous metadata").unwrap();
+
+        let mut settings = Settings::load(None).unwrap();
+        settings.output.path = output.to_string_lossy().into_owned();
+        settings.output.metadata_path = Some(metadata.clone());
+
+        let error = preflight_output(&settings).unwrap_err();
+        assert!(
+            error.to_string().contains("already exists"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), b"previous capture");
+        assert_eq!(std::fs::read(&metadata).unwrap(), b"previous metadata");
+
+        settings.output.overwrite = true;
+        preflight_output(&settings).unwrap();
+        // The preflight itself is non-destructive even with overwrite; the
+        // writer performs the truncation only after startup succeeds.
+        assert_eq!(std::fs::read(&output).unwrap(), b"previous capture");
+    }
+
+    #[test]
+    fn preflight_rejects_existing_rotation_segments_and_manifest() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("capture.sbe");
+        let manifest = rotation_manifest_path(output.to_str().unwrap());
+        std::fs::write(directory.path().join("capture.sbe.000001.sbe"), b"old").unwrap();
+        std::fs::write(&manifest, b"old").unwrap();
+
+        let mut settings = Settings::load(None).unwrap();
+        settings.output.path = output.to_string_lossy().into_owned();
+        settings.output.rotate_bytes = settings.output.chunk_size as u64;
+        let error = preflight_output(&settings).unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+
+        settings.output.overwrite = true;
+        preflight_output(&settings).unwrap();
+    }
+
+    #[test]
+    fn rotation_scan_owns_only_exactly_named_segments() {
+        assert!(rotation_artifact_name(
+            "capture.sbe.",
+            "capture.sbe.000001.sbe"
+        ));
+        assert!(rotation_artifact_name(
+            "capture.sbe.",
+            "capture.sbe.000001.sbe.partial"
+        ));
+        assert!(!rotation_artifact_name(
+            "capture.sbe.",
+            "capture.sbe.backup.sbe"
+        ));
+        assert!(!rotation_artifact_name("capture.sbe.", "capture.sbe.1.sbe"));
+    }
+
+    #[test]
     fn rejects_directory_output_and_stdout_sidecars() {
         let directory = tempfile::tempdir().unwrap();
         let mut settings = Settings::load(None).unwrap();
@@ -742,6 +1047,46 @@ mod tests {
         settings.polymarket.gamma_url = gamma.to_owned();
         settings.polymarket.ws_url = ws.to_owned();
         settings
+    }
+
+    #[test]
+    fn checked_in_examples_parse_and_validate() {
+        for path in ["config.example.toml", "config.polymarket.example.toml"] {
+            let settings = Settings::load(Some(Path::new(path)))
+                .unwrap_or_else(|error| panic!("{path} must load: {error:#}"));
+            assert_eq!(settings.collector.catalog_mode, CatalogMode::Off);
+            assert!(!settings.output.overwrite);
+        }
+    }
+
+    #[test]
+    fn validates_capacity_catalog_and_rotation_bounds() {
+        let mut settings = Settings::load(None).unwrap();
+        assert!(settings.validate().is_ok());
+
+        settings.collector.max_total_connections = settings.collector.replicas - 1;
+        assert!(settings.validate().is_err());
+        settings.collector.max_total_connections = 64;
+
+        settings.collector.connect_concurrency = 0;
+        assert!(settings.validate().is_err());
+        settings.collector.connect_concurrency = 8;
+
+        settings.collector.catalog_mode = CatalogMode::Require;
+        assert!(settings.validate().is_err());
+        settings.collector.catalog_path = Some(PathBuf::from("catalog.json"));
+        assert!(settings.validate().is_ok());
+        settings.collector.catalog_mode = CatalogMode::Off;
+
+        settings.output.rotate_bytes = settings.output.chunk_size as u64 - 1;
+        assert!(settings.validate().is_err());
+        settings.output.rotate_bytes = settings.output.chunk_size as u64;
+        assert!(settings.validate().is_ok());
+
+        settings.collector.readiness_min_anchored_fraction = 1.01;
+        assert!(settings.validate().is_err());
+        settings.collector.readiness_min_anchored_fraction = 0.99;
+        assert!(settings.validate().is_ok());
     }
 
     #[test]

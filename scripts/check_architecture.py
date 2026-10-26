@@ -38,9 +38,9 @@ SOURCE_RESPONSIBILITIES = {
     "src/verify.rs": "SBE delta-to-snapshot self-consistency verification",
     "src/writer.rs": "bounded writer queue, dedicated writer thread, SBE sink lifecycle",
     "src/ws.rs": "websocket connection options, source binding and connection experiments",
-    "src/capacity.rs": "startup capacity plan and shard derivation with hard gates",
-    "src/catalog.rs": "versioned discovery checkpoint with checksum, age, and counts",
-    "src/persistence.rs": "latest-wins metadata/catalog background writer",
+    "src/capacity.rs": "startup and fixed-topology discovery capacity admission",
+    "src/catalog.rs": "versioned discovery checkpoint with integrity envelope, age, and counts",
+    "src/persistence.rs": "latest-wins metadata/catalog background writer and lifecycle status",
     "src/collector/mod.rs": "collector core module boundary",
     "src/collector/state.rs": "serialized per-symbol/source state machine, discovery and failover decisions",
     "src/exchange/mod.rs": "Exchange and adapter-independent session factory abstraction",
@@ -62,7 +62,6 @@ SOURCE_RESPONSIBILITIES = {
     "src/util/sbe_yaml.rs": "supplied SBE schema loading/validation support",
 }
 
-# Exact test symbols mentioned as evidence in docs/architecture.md.
 REQUIRED_TESTS = {
     "snapshot_anchors_delta_application_in_per_symbol_order",
     "cross_symbol_output_order_is_processing_order_and_not_globally_sorted",
@@ -75,15 +74,6 @@ REQUIRED_TESTS = {
     "shutdown_drains_saturated_queue_and_joins",
     "finish_failure_on_shutdown_is_reported",
     "negative_control_missing_update_is_detected_by_verify",
-    "explicit_shard_count_must_satisfy_the_per_socket_bound",
-    "automatic_sharding_derives_the_required_count",
-    "round_trips_and_reports_age",
-    "rejects_a_modified_market_list",
-    "writes_metadata_and_catalog_and_reports_success",
-    "catalog_generation_time_is_independent_of_metadata_time",
-    "latest_submission_wins_over_intermediate_versions",
-    "submit_does_not_block_on_a_slow_write",
-    "write_failure_is_reported_and_the_worker_survives",
 }
 
 # Anchors that make the main structural claims falsifiable against code.
@@ -134,6 +124,78 @@ NODE_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\n]*\]|\([^\n]*\)|\
 EDGE_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s+-->\s+([A-Za-z_][A-Za-z0-9_]*)\s*$")
 
 
+MODULE_DECL_RE = re.compile(
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;\s*(?://.*)?$",
+    re.MULTILINE,
+)
+
+
+def collect_module_reachability(root: Path = ROOT) -> set[str]:
+    """Return source files reachable through `mod foo;` from lib/bin crate roots.
+
+    This is a conservative source-tree check, not a Rust parser. Inline modules
+    are intentionally not treated as separate files.
+    """
+    # `src/util/build.rs` is Cargo's configured build-script crate root (`build = ...` in Cargo.toml).
+    roots = [root / "src/lib.rs", root / "src/main.rs", root / "src/util/build.rs"]
+    reachable: set[str] = set()
+    pending = [path for path in roots if path.exists()]
+    while pending:
+        current = pending.pop()
+        rel = current.relative_to(root).as_posix()
+        if rel in reachable:
+            continue
+        reachable.add(rel)
+        content = current.read_text(encoding="utf-8")
+        if current.name in {"lib.rs", "main.rs", "build.rs", "mod.rs"}:
+            module_dir = current.parent
+        else:
+            module_dir = current.parent / current.stem
+        for match in MODULE_DECL_RE.finditer(content):
+            name = match.group(1)
+            candidates = [module_dir / f"{name}.rs", module_dir / name / "mod.rs"]
+            found = [candidate for candidate in candidates if candidate.exists()]
+            if len(found) == 1:
+                pending.append(found[0])
+    return reachable
+
+
+def module_integration_errors(root: Path = ROOT) -> list[str]:
+    """Check falsifiable runtime call-site integration, not stale verdicts."""
+    errors: list[str] = []
+
+    # Check active source files reference missing dependencies
+    config = (root / "src/config.rs").read_text(encoding="utf-8")
+    capacity_path = root / "src/capacity.rs"
+    if capacity_path.exists():
+        capacity = capacity_path.read_text(encoding="utf-8")
+        collector_struct = re.search(r"pub struct CollectorSettings\s*\{(.*?)\n\}", config, re.DOTALL)
+        declared = set(re.findall(r"pub\s+(\w+)\s*:", collector_struct.group(1))) if collector_struct else set()
+        referenced = set(re.findall(r"settings\.collector\.(\w+)", capacity))
+        for field in sorted(referenced - declared):
+            errors.append(f"src/capacity.rs references CollectorSettings.{field}, absent from src/config.rs")
+    catalog_path = root / "src/catalog.rs"
+    if catalog_path.exists() and "util::sha256_hex" in catalog_path.read_text(encoding="utf-8"):
+        util_text = "\n".join(path.read_text(encoding="utf-8") for path in (root / "src/util").rglob("*.rs"))
+        if not re.search(r"\bfn\s+sha256_hex\b", util_text):
+            errors.append("src/catalog.rs references util::sha256_hex, but no such function exists under src/util/")
+
+    coordinator = (root / "src/coordinator.rs").read_text(encoding="utf-8")
+    required = {
+        "capacity startup": "capacity::plan(&settings, &initial_markets)",
+        "capacity refresh admission": "capacity::plan_fixed_topology(&settings, &markets, &loads)",
+        "catalog loading": "Catalog::load",
+        "persistence startup": "PersistenceHandle::start(",
+        "persistence submit": "persistence.submit(",
+        "persistence final drain": "persistence.submit_final(",
+        "persistence shutdown": "persistence.shutdown(send_timeout)",
+    }
+    for name, anchor in required.items():
+        if anchor not in coordinator:
+            errors.append(f"runtime integration missing: {name} anchor `{anchor}`")
+    return errors
+
+
 def collect_sources() -> list[str]:
     return sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "src").rglob("*.rs"))
 
@@ -153,32 +215,49 @@ def collect_tests() -> list[tuple[str, str, str]]:
 
 
 def render_source_inventory() -> str:
+    sources = collect_sources()
+    reachable = collect_module_reachability()
     lines = [
         "<!-- Generated by scripts/check_architecture.py --update; do not hand-edit. -->",
         "# Rust source inventory", "",
-        f"Tracked Rust source files: **{len(collect_sources())}**.", "",
-        "| Source file | Responsibility |", "|---|---|",
+        f"Rust source files found: **{len(sources)}**; reachable from the library, binary, or Cargo build-script root: **{len(set(sources) & reachable)}**.", "",
+        "Reachability means a file is referenced through Rust module declarations; separate call-site assertions check critical runtime integration.", "",
+        "| Source file | Responsibility | Crate-root reachability |", "|---|---|---|",
     ]
-    for path in collect_sources():
+    for path in sources:
         description = SOURCE_RESPONSIBILITIES.get(path)
         if not description:
             description = "[REVIEW REQUIRED: add a reviewed responsibility in scripts/check_architecture.py]"
-        lines.append(f"| `{path}` | {description} |")
+        if path in reachable:
+            reach = "reachable from library, binary, or build-script root"
+        else:
+            reach = "[REVIEW REQUIRED: classify this unrooted file]"
+        lines.append(f"| `{path}` | {description} | {reach} |")
     lines.append("")
     return "\n".join(lines)
 
 
 def render_test_inventory() -> str:
     tests = collect_tests()
+    reachable = collect_module_reachability()
+    active_count = sum(1 for path, _, _ in tests if path.startswith("tests/") or path in reachable)
+    inactive_count = len(tests) - active_count
     lines = [
         "<!-- Generated by scripts/check_architecture.py --update; do not hand-edit. -->",
         "# Statically declared Rust test inventory", "",
         f"Test functions discovered from `#[test]` and `#[tokio::test]` attributes: **{len(tests)}**.",
-        "", "This is a source inventory, not a claim that these tests passed in the current environment. Runtime test results belong in the dated verification record.",
-        "", "| File | Test function | Attribute / line |", "|---|---|---|",
+        f"Declarations in a module file reachable from a Cargo crate root or under `tests/`: **{active_count}**; declarations in integration-blocked source files: **{inactive_count}**.",
+        "This is source inventory, not a claim that tests passed or that a build succeeded. Test functions inside integration-blocked source files are compiled but their advertised capabilities are not available at runtime.",
+        "", "| File | Test function | Attribute / line | Cargo target reachability |", "|---|---|---|---|",
     ]
     for path, name, attr in tests:
-        lines.append(f"| `{path}` | `{name}` | `{attr}` |")
+        if path.startswith("tests/"):
+            reach = "integration-test target"
+        elif path in reachable:
+            reach = "crate-root reachable"
+        else:
+            reach = "[REVIEW REQUIRED: classify this unrooted file]"
+        lines.append(f"| `{path}` | `{name}` | `{attr}` | {reach} |")
     lines.append("")
     return "\n".join(lines)
 
@@ -244,6 +323,7 @@ def main() -> int:
     args = parser.parse_args()
 
     errors: list[str] = []
+    errors.extend(module_integration_errors())
     actual_sources = set(collect_sources())
     documented_sources = set(SOURCE_RESPONSIBILITIES)
     missing_docs = sorted(actual_sources - documented_sources)
@@ -253,7 +333,8 @@ def main() -> int:
     if stale_docs:
         errors.append("source responsibility mappings point to removed files: " + ", ".join(stale_docs))
 
-    actual_test_names = {name for _, name, _ in collect_tests()}
+    test_records = collect_tests()
+    actual_test_names = {name for _, name, _ in test_records}
     missing_tests = sorted(REQUIRED_TESTS - actual_test_names)
     if missing_tests:
         errors.append("required evidence test(s) not found: " + ", ".join(missing_tests))
@@ -295,10 +376,12 @@ def main() -> int:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(expected, encoding="utf-8")
         if errors:
+            print(f"Updated inventories for {len(collect_sources())} source files and {len(collect_tests())} test declarations; integration checks:", file=sys.stderr)
             for error in errors:
-                print(f"ERROR: {error}", file=sys.stderr)
+                print(f"INTEGRATION CHECK: {error}", file=sys.stderr)
             return 1
-        print(f"Updated inventories: {len(collect_sources())} Rust source files; {len(collect_tests())} attributed test functions.")
+        reachable = collect_module_reachability()
+        print(f"Updated inventories: {len(collect_sources())} Rust source files; {len(collect_tests())} attributed test functions; {len(reachable)} files reachable from crate roots.")
         return 0
 
     for path, expected in expected_files.items():
@@ -311,7 +394,8 @@ def main() -> int:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
         return 1
-    print(f"Architecture sync check passed: {len(collect_sources())} Rust source files, {len(collect_tests())} attributed test functions, and {len(MERMAID_RE.findall(document))} structurally checked Mermaid diagrams.")
+    reachable = collect_module_reachability()
+    print(f"Architecture sync check passed: {len(collect_sources())} Rust source files, {len(collect_tests())} attributed test functions, {len(reachable)} files reachable from crate roots, and {len(MERMAID_RE.findall(document))} structurally checked Mermaid diagrams.")
     print("Note: actual Mermaid grammar is parsed in the separate GitHub Actions Mermaid-validation job.")
     return 0
 

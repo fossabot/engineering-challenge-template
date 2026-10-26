@@ -6,7 +6,7 @@ use std::{net::SocketAddr, path::PathBuf};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 
-use engineering_challenge::config::{ExchangeKind, KalshiEnvironment, Settings};
+use engineering_challenge::config::{CatalogMode, ExchangeKind, KalshiEnvironment, Settings};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -62,6 +62,45 @@ pub struct Cli {
     /// `AlignedSbeReader`. Must be a power of two of at least 1024 bytes.
     #[arg(long, global = true, value_name = "BYTES")]
     pub chunk_size: Option<usize>,
+
+    /// Replace existing capture, sidecar, catalog, manifest, and segment
+    /// files. Without this flag any existing artifact is a startup error.
+    #[arg(long, global = true)]
+    pub overwrite: bool,
+
+    /// Rotate the capture after this many bytes. Zero disables size rotation.
+    #[arg(long, global = true, value_name = "BYTES")]
+    pub rotate_bytes: Option<u64>,
+
+    /// Rotate the capture after this many seconds. Zero disables time rotation.
+    #[arg(long, global = true, value_name = "SECONDS")]
+    pub rotate_secs: Option<u64>,
+
+    /// Stop before free space on the output filesystem drops below this many
+    /// bytes. Zero disables the watermark.
+    #[arg(long, global = true, value_name = "BYTES")]
+    pub min_free_bytes: Option<u64>,
+
+    /// Fsync the active capture or segment at this cadence. Zero syncs only on
+    /// rotation and shutdown.
+    #[arg(long, global = true, value_name = "SECONDS")]
+    pub fsync_interval_secs: Option<u64>,
+
+    /// Last-known-good catalog checkpoint.
+    #[arg(long, global = true, value_name = "FILE")]
+    pub catalog: Option<PathBuf>,
+
+    /// Catalog bootstrap policy.
+    #[arg(long = "catalog-mode", global = true, value_enum)]
+    pub catalog_mode: Option<CatalogMode>,
+
+    /// Maximum accepted checkpoint age for warm and require modes.
+    #[arg(long, global = true, value_name = "SECONDS")]
+    pub catalog_max_age_secs: Option<u64>,
+
+    /// Maximum simultaneous websocket connection attempts.
+    #[arg(long, global = true, value_name = "N")]
+    pub connect_concurrency: Option<usize>,
 
     #[arg(long, global = true)]
     pub shards: Option<usize>,
@@ -176,6 +215,33 @@ impl Cli {
         }
         if let Some(chunk_size) = self.chunk_size {
             settings.output.chunk_size = chunk_size;
+        }
+        if self.overwrite {
+            settings.output.overwrite = true;
+        }
+        if let Some(bytes) = self.rotate_bytes {
+            settings.output.rotate_bytes = bytes;
+        }
+        if let Some(seconds) = self.rotate_secs {
+            settings.output.rotate_secs = seconds;
+        }
+        if let Some(bytes) = self.min_free_bytes {
+            settings.output.min_free_bytes = bytes;
+        }
+        if let Some(seconds) = self.fsync_interval_secs {
+            settings.output.fsync_interval_secs = seconds;
+        }
+        if let Some(path) = &self.catalog {
+            settings.collector.catalog_path = Some(path.clone());
+        }
+        if let Some(mode) = self.catalog_mode {
+            settings.collector.catalog_mode = mode;
+        }
+        if let Some(seconds) = self.catalog_max_age_secs {
+            settings.collector.catalog_max_age_secs = seconds;
+        }
+        if let Some(concurrency) = self.connect_concurrency {
+            settings.collector.connect_concurrency = concurrency;
         }
         if let Some(shards) = self.shards {
             settings.collector.shards = shards;

@@ -15,18 +15,58 @@ use std::{
     io::{BufWriter, Stdout},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, atomic::Ordering},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};
 
 use crate::{
+    config::{Settings, rotation_manifest_path},
     metrics::{WriterCounters, WriterStats},
     model::OutputMessage,
+    report::{serialize_json_pretty, write_bytes_atomic},
+    time::now_us,
     util::AlignedSbeWriter,
 };
+
+/// Everything the writer thread needs to create and rotate its output.
+#[derive(Debug, Clone)]
+pub struct WriterOptions {
+    pub path: String,
+    pub chunk_size: usize,
+    pub queue: usize,
+    pub sync_on_close: bool,
+    pub overwrite: bool,
+    pub rotate_bytes: u64,
+    pub rotate_secs: u64,
+    pub min_free_bytes: u64,
+    pub fsync_interval_secs: u64,
+}
+
+impl WriterOptions {
+    #[must_use]
+    pub fn from_settings(settings: &Settings) -> Self {
+        Self {
+            path: settings.output.path.clone(),
+            chunk_size: settings.output.chunk_size,
+            queue: settings.collector.writer_queue,
+            sync_on_close: settings.output.sync_on_close,
+            overwrite: settings.output.overwrite,
+            rotate_bytes: settings.output.rotate_bytes,
+            rotate_secs: settings.output.rotate_secs,
+            min_free_bytes: settings.output.min_free_bytes,
+            fsync_interval_secs: settings.output.fsync_interval_secs,
+        }
+    }
+
+    #[must_use]
+    pub fn rotation_enabled(&self) -> bool {
+        self.path != "-" && (self.rotate_bytes > 0 || self.rotate_secs > 0)
+    }
+}
 
 enum WriterCommand {
     Message(OutputMessage),
@@ -48,40 +88,424 @@ trait MessageSink: Send + 'static {
     /// Persist flushed bytes to the storage layer where the sink supports it.
     fn sync(&mut self) -> anyhow::Result<()>;
     fn bytes_written(&self) -> u64;
+    /// Finalized rotation segments. Zero for unrotated output.
+    fn segments(&self) -> u64;
 }
 
-enum Sink {
-    File(AlignedSbeWriter<BufWriter<File>>),
-    Stdout(AlignedSbeWriter<BufWriter<Stdout>>),
+/// One unrotated file with a free-space watermark and periodic fsync.
+struct FileSink {
+    writer: AlignedSbeWriter<BufWriter<File>>,
+    path: PathBuf,
+    min_free_bytes: u64,
+    fsync_interval: Duration,
+    last_sync: Instant,
+    watermark_checked: bool,
+    last_watermark: Instant,
 }
 
-impl Sink {
-    fn open(path: &str, chunk_size: usize) -> anyhow::Result<Self> {
-        if path == "-" {
-            let writer = BufWriter::with_capacity(chunk_size.min(1 << 20), std::io::stdout());
-            return Ok(Self::Stdout(AlignedSbeWriter::from_writer(
-                writer, chunk_size,
-            )?));
-        }
-        if let Some(parent) = Path::new(path).parent()
+impl FileSink {
+    fn open(options: &WriterOptions) -> anyhow::Result<Self> {
+        let path = Path::new(&options.path);
+        if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating output directory `{}`", parent.display()))?;
         }
-        let writer = AlignedSbeWriter::create(path, chunk_size)
-            .with_context(|| format!("creating output `{path}`"))?;
-        Ok(Self::File(writer))
+        let writer = if options.overwrite {
+            AlignedSbeWriter::create(path, options.chunk_size)
+        } else {
+            AlignedSbeWriter::create_new(path, options.chunk_size)
+        }
+        .with_context(|| {
+            if options.overwrite {
+                format!("creating output `{}`", options.path)
+            } else {
+                format!(
+                    "creating output `{}` without replacing an existing file \
+                     (set output.overwrite = true to replace it)",
+                    options.path
+                )
+            }
+        })?;
+        Ok(Self {
+            writer,
+            path: path.to_path_buf(),
+            min_free_bytes: options.min_free_bytes,
+            fsync_interval: Duration::from_secs(options.fsync_interval_secs),
+            last_sync: Instant::now(),
+            watermark_checked: false,
+            last_watermark: Instant::now(),
+        })
+    }
+
+    fn check_watermark(&mut self) -> anyhow::Result<()> {
+        if self.min_free_bytes == 0 {
+            return Ok(());
+        }
+        if self.watermark_checked && self.last_watermark.elapsed() < Duration::from_secs(5) {
+            return Ok(());
+        }
+        self.watermark_checked = true;
+        self.last_watermark = Instant::now();
+        let directory = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let free = free_bytes(directory)?;
+        anyhow::ensure!(
+            free >= self.min_free_bytes,
+            "output filesystem at `{}` has {free} free bytes, below \
+             output.min_free_bytes = {}; refusing to continue toward a full disk",
+            directory.display(),
+            self.min_free_bytes
+        );
+        Ok(())
+    }
+
+    fn maybe_sync(&mut self) -> anyhow::Result<()> {
+        if !self.fsync_interval.is_zero() && self.last_sync.elapsed() >= self.fsync_interval {
+            self.writer.sync_data()?;
+            self.last_sync = Instant::now();
+        }
+        Ok(())
+    }
+}
+
+impl MessageSink for FileSink {
+    fn write(&mut self, message: &OutputMessage) -> anyhow::Result<()> {
+        self.check_watermark()?;
+        match message {
+            OutputMessage::Snapshot(snapshot) => self.writer.write_msg(snapshot)?,
+            OutputMessage::PriceLevelUpdate(update) => self.writer.write_msg(update)?,
+        }
+        self.maybe_sync()
+    }
+
+    fn flush(&mut self) -> anyhow::Result<()> {
+        self.writer.flush()?;
+        self.maybe_sync()
+    }
+
+    fn finish(&mut self) -> anyhow::Result<()> {
+        self.writer.finish()
+    }
+
+    fn sync(&mut self) -> anyhow::Result<()> {
+        self.writer.sync_all()
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.writer.bytes_written()
+    }
+
+    fn segments(&self) -> u64 {
+        0
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SegmentEntry {
+    sequence: u64,
+    file: String,
+    bytes: u64,
+    sha256: String,
+    finalized_at_us: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SegmentManifest {
+    schema_version: u32,
+    output: String,
+    chunk_size: usize,
+    created_at_us: i64,
+    updated_at_us: i64,
+    complete: bool,
+    segments: Vec<SegmentEntry>,
+}
+
+/// Size- or time-bounded segments, each finalized atomically and listed in a
+/// checksummed manifest.
+struct RotatingSink {
+    options: WriterOptions,
+    base_path: PathBuf,
+    manifest_path: PathBuf,
+    created_at_us: i64,
+    sequence: u64,
+    writer: Option<AlignedSbeWriter<BufWriter<File>>>,
+    segment_partial: Option<PathBuf>,
+    segment_final: Option<PathBuf>,
+    messages_in_segment: u64,
+    segment_started: Instant,
+    finalized_bytes: u64,
+    segments: Vec<SegmentEntry>,
+    last_sync: Instant,
+    watermark_checked: bool,
+    last_watermark: Instant,
+}
+
+impl RotatingSink {
+    fn open(options: &WriterOptions) -> anyhow::Result<Self> {
+        let base_path = PathBuf::from(&options.path);
+        if let Some(parent) = base_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating output directory `{}`", parent.display()))?;
+        }
+        let manifest_path = rotation_manifest_path(&options.path);
+        if options.overwrite {
+            remove_existing_segments(&base_path, &manifest_path)?;
+        }
+        let mut sink = Self {
+            options: options.clone(),
+            base_path,
+            manifest_path,
+            created_at_us: now_us().unwrap_or(0),
+            sequence: 0,
+            writer: None,
+            segment_partial: None,
+            segment_final: None,
+            messages_in_segment: 0,
+            segment_started: Instant::now(),
+            finalized_bytes: 0,
+            segments: Vec::new(),
+            last_sync: Instant::now(),
+            watermark_checked: false,
+            last_watermark: Instant::now(),
+        };
+        sink.open_segment()?;
+        sink.write_manifest(false)?;
+        Ok(sink)
+    }
+
+    fn check_watermark(&mut self) -> anyhow::Result<()> {
+        if self.options.min_free_bytes == 0 {
+            return Ok(());
+        }
+        if self.watermark_checked && self.last_watermark.elapsed() < Duration::from_secs(5) {
+            return Ok(());
+        }
+        self.watermark_checked = true;
+        self.last_watermark = Instant::now();
+        let directory = self.base_path.parent().unwrap_or_else(|| Path::new("."));
+        let free = free_bytes(directory)?;
+        anyhow::ensure!(
+            free >= self.options.min_free_bytes,
+            "output filesystem at `{}` has {free} free bytes, below \
+             output.min_free_bytes = {}; refusing to continue toward a full disk",
+            directory.display(),
+            self.options.min_free_bytes
+        );
+        Ok(())
+    }
+
+    fn open_segment(&mut self) -> anyhow::Result<()> {
+        let final_path = segment_path(&self.base_path, self.sequence);
+        let partial = partial_path(&final_path);
+        if !self.options.overwrite && final_path.exists() {
+            anyhow::bail!(
+                "rotation segment `{}` already exists; set output.overwrite = true \
+                 to replace existing segments",
+                final_path.display()
+            );
+        }
+        let writer = if self.options.overwrite {
+            AlignedSbeWriter::create(&partial, self.options.chunk_size)
+        } else {
+            AlignedSbeWriter::create_new(&partial, self.options.chunk_size)
+        }
+        .with_context(|| format!("creating rotation segment `{}`", partial.display()))?;
+        let mut writer = writer;
+        writer.enable_checksum()?;
+        self.writer = Some(writer);
+        self.segment_partial = Some(partial);
+        self.segment_final = Some(final_path);
+        self.messages_in_segment = 0;
+        self.segment_started = Instant::now();
+        Ok(())
+    }
+
+    fn should_rotate(&self) -> bool {
+        if self.messages_in_segment == 0 {
+            return false;
+        }
+        let bytes_reached = self.options.rotate_bytes > 0
+            && self
+                .writer
+                .as_ref()
+                .is_some_and(|writer| writer.bytes_written() >= self.options.rotate_bytes);
+        let time_reached = self.options.rotate_secs > 0
+            && self.segment_started.elapsed()
+                >= Duration::from_secs(self.options.rotate_secs.max(1));
+        bytes_reached || time_reached
+    }
+
+    fn finalize_segment(&mut self) -> anyhow::Result<()> {
+        let Some(mut writer) = self.writer.take() else {
+            return Ok(());
+        };
+        let Some(partial) = self.segment_partial.take() else {
+            anyhow::bail!("rotation segment has no temporary path");
+        };
+        let Some(final_path) = self.segment_final.take() else {
+            anyhow::bail!("rotation segment has no final path");
+        };
+        if self.messages_in_segment == 0 {
+            drop(writer);
+            let _ = std::fs::remove_file(&partial);
+            return Ok(());
+        }
+        writer.finish()?;
+        writer.sync_all()?;
+        let sha256 = writer
+            .checksum_hex()
+            .context("rotation segment checksum was not enabled")?;
+        let bytes = writer.bytes_written();
+        drop(writer);
+        if final_path.exists() {
+            if !self.options.overwrite {
+                anyhow::bail!("rotation segment `{}` already exists", final_path.display());
+            }
+            std::fs::remove_file(&final_path).with_context(|| {
+                format!("replacing rotation segment `{}`", final_path.display())
+            })?;
+        }
+        std::fs::rename(&partial, &final_path).with_context(|| {
+            format!(
+                "finalizing rotation segment `{}` as `{}`",
+                partial.display(),
+                final_path.display()
+            )
+        })?;
+        self.finalized_bytes = self.finalized_bytes.saturating_add(bytes);
+        let file = final_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("rotation segment has no file name")?
+            .to_owned();
+        self.segments.push(SegmentEntry {
+            sequence: self.sequence,
+            file,
+            bytes,
+            sha256,
+            finalized_at_us: now_us().unwrap_or(0),
+        });
+        self.sequence = self.sequence.saturating_add(1);
+        self.write_manifest(false)
+    }
+
+    fn write_manifest(&self, complete: bool) -> anyhow::Result<()> {
+        let manifest = SegmentManifest {
+            schema_version: 1,
+            output: self.options.path.clone(),
+            chunk_size: self.options.chunk_size,
+            created_at_us: self.created_at_us,
+            updated_at_us: now_us().unwrap_or(self.created_at_us),
+            complete,
+            segments: self.segments.clone(),
+        };
+        let bytes = serialize_json_pretty(&self.manifest_path, &manifest)?;
+        write_bytes_atomic(&self.manifest_path, &bytes).with_context(|| {
+            format!(
+                "writing rotation manifest `{}`",
+                self.manifest_path.display()
+            )
+        })
+    }
+
+    fn maybe_sync(&mut self) -> anyhow::Result<()> {
+        let interval = Duration::from_secs(self.options.fsync_interval_secs);
+        if interval.is_zero() || self.last_sync.elapsed() < interval {
+            return Ok(());
+        }
+        if let Some(writer) = &mut self.writer {
+            writer.sync_data()?;
+        }
+        self.last_sync = Instant::now();
+        Ok(())
+    }
+}
+
+impl MessageSink for RotatingSink {
+    fn write(&mut self, message: &OutputMessage) -> anyhow::Result<()> {
+        self.check_watermark()?;
+        if self.writer.is_none() {
+            self.open_segment()?;
+        }
+        if self.should_rotate() {
+            self.finalize_segment()?;
+            self.open_segment()?;
+        }
+        let writer = self
+            .writer
+            .as_mut()
+            .context("rotation segment is not open")?;
+        match message {
+            OutputMessage::Snapshot(snapshot) => writer.write_msg(snapshot)?,
+            OutputMessage::PriceLevelUpdate(update) => writer.write_msg(update)?,
+        }
+        self.messages_in_segment = self.messages_in_segment.saturating_add(1);
+        self.maybe_sync()
+    }
+
+    fn flush(&mut self) -> anyhow::Result<()> {
+        if let Some(writer) = &mut self.writer {
+            writer.flush()?;
+        }
+        self.maybe_sync()
+    }
+
+    fn finish(&mut self) -> anyhow::Result<()> {
+        self.finalize_segment()?;
+        self.write_manifest(true)
+    }
+
+    fn sync(&mut self) -> anyhow::Result<()> {
+        if let Some(writer) = &mut self.writer {
+            writer.sync_data()?;
+        }
+        Ok(())
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.finalized_bytes.saturating_add(
+            self.writer
+                .as_ref()
+                .map_or(0, AlignedSbeWriter::bytes_written),
+        )
+    }
+
+    fn segments(&self) -> u64 {
+        self.segments.len() as u64
+    }
+}
+
+enum Sink {
+    File(FileSink),
+    Rotating(RotatingSink),
+    Stdout(AlignedSbeWriter<BufWriter<Stdout>>),
+}
+
+impl Sink {
+    fn open(options: &WriterOptions) -> anyhow::Result<Self> {
+        if options.path == "-" {
+            let writer =
+                BufWriter::with_capacity(options.chunk_size.min(1 << 20), std::io::stdout());
+            return Ok(Self::Stdout(AlignedSbeWriter::from_writer(
+                writer,
+                options.chunk_size,
+            )?));
+        }
+        if options.rotation_enabled() {
+            return Ok(Self::Rotating(RotatingSink::open(options)?));
+        }
+        Ok(Self::File(FileSink::open(options)?))
     }
 }
 
 impl MessageSink for Sink {
     fn write(&mut self, message: &OutputMessage) -> anyhow::Result<()> {
         match self {
-            Self::File(writer) => match message {
-                OutputMessage::Snapshot(snapshot) => writer.write_msg(snapshot),
-                OutputMessage::PriceLevelUpdate(update) => writer.write_msg(update),
-            },
+            Self::File(sink) => sink.write(message),
+            Self::Rotating(sink) => sink.write(message),
             Self::Stdout(writer) => match message {
                 OutputMessage::Snapshot(snapshot) => writer.write_msg(snapshot),
                 OutputMessage::PriceLevelUpdate(update) => writer.write_msg(update),
@@ -91,31 +515,149 @@ impl MessageSink for Sink {
 
     fn flush(&mut self) -> anyhow::Result<()> {
         match self {
-            Self::File(writer) => writer.flush(),
+            Self::File(sink) => sink.flush(),
+            Self::Rotating(sink) => sink.flush(),
             Self::Stdout(writer) => writer.flush(),
         }
     }
 
     fn finish(&mut self) -> anyhow::Result<()> {
         match self {
-            Self::File(writer) => writer.finish(),
+            Self::File(sink) => sink.finish(),
+            Self::Rotating(sink) => sink.finish(),
             Self::Stdout(writer) => writer.finish(),
         }
     }
 
     fn sync(&mut self) -> anyhow::Result<()> {
-        if let Self::File(writer) = self {
-            writer.sync_all()?;
+        match self {
+            Self::File(sink) => sink.sync(),
+            Self::Rotating(sink) => sink.sync(),
+            Self::Stdout(_) => Ok(()),
         }
-        Ok(())
     }
 
     fn bytes_written(&self) -> u64 {
         match self {
-            Self::File(writer) => writer.bytes_written(),
+            Self::File(sink) => sink.bytes_written(),
+            Self::Rotating(sink) => sink.bytes_written(),
             Self::Stdout(writer) => writer.bytes_written(),
         }
     }
+
+    fn segments(&self) -> u64 {
+        match self {
+            Self::File(sink) => sink.segments(),
+            Self::Rotating(sink) => sink.segments(),
+            Self::Stdout(_) => 0,
+        }
+    }
+}
+
+fn segment_path(base: &Path, sequence: u64) -> PathBuf {
+    let name = base
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("output");
+    base.with_file_name(format!("{name}.{sequence:06}.sbe"))
+}
+
+fn partial_path(segment: &Path) -> PathBuf {
+    let name = segment
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("segment.sbe");
+    segment.with_file_name(format!("{name}.partial"))
+}
+
+/// Remove only the artifacts this run's rotation namespace owns.
+fn remove_existing_segments(base: &Path, manifest: &Path) -> anyhow::Result<()> {
+    let Some(parent) = base.parent() else {
+        return Ok(());
+    };
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let prefix = format!(
+        "{}.",
+        base.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("output")
+    );
+    if parent.exists() {
+        for entry in std::fs::read_dir(parent)?.flatten() {
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            if rotation_artifact_name(&prefix, file_name) {
+                std::fs::remove_file(entry.path()).with_context(|| {
+                    format!("removing previous segment `{}`", entry.path().display())
+                })?;
+            }
+        }
+    }
+    if manifest.exists() {
+        std::fs::remove_file(manifest)
+            .with_context(|| format!("removing previous manifest `{}`", manifest.display()))?;
+    }
+    Ok(())
+}
+
+fn rotation_artifact_name(prefix: &str, name: &str) -> bool {
+    let stem = name.strip_prefix(prefix).and_then(|value| {
+        value
+            .strip_suffix(".sbe")
+            .or_else(|| value.strip_suffix(".sbe.partial"))
+    });
+    stem.is_some_and(|sequence| {
+        sequence.len() == 6 && sequence.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+#[cfg(unix)]
+fn free_bytes(path: &Path) -> anyhow::Result<u64> {
+    let path = if path.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        path
+    };
+    // `df -Pk` is the POSIX machine-readable form: one row per filesystem and
+    // a 1024-byte block size. Parsing the fourth column avoids locale-specific
+    // human formatting. The probe runs at most once every five seconds.
+    let output = std::process::Command::new("df")
+        .arg("-Pk")
+        .arg(path)
+        .output()
+        .with_context(|| format!("running `df` for `{}`", path.display()))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "`df` failed for `{}`: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let row = text
+        .lines()
+        .nth(1)
+        .with_context(|| format!("`df` returned no data row for `{}`", path.display()))?;
+    let available_kb = row
+        .split_whitespace()
+        .nth(3)
+        .with_context(|| format!("`df` returned no available column for `{}`", path.display()))?
+        .parse::<u64>()
+        .with_context(|| format!("parsing `df` available space for `{}`", path.display()))?;
+    Ok(available_kb.saturating_mul(1024))
+}
+
+#[cfg(not(unix))]
+fn free_bytes(_path: &Path) -> anyhow::Result<u64> {
+    // Without a portable free-space API the watermark is advisory. The
+    // operating envelope documents Unix as the supported deployment target.
+    Ok(u64::MAX)
 }
 
 /// Async handle used by the coordinator.
@@ -131,14 +673,14 @@ impl WriterHandle {
     /// Start the writer thread. The output file is created immediately so an
     /// empty, valid file exists even if the process is interrupted during
     /// startup.
-    pub fn start(
-        path: &str,
-        chunk_size: usize,
-        queue: usize,
-        sync_on_close: bool,
-    ) -> anyhow::Result<Self> {
-        let sink = Sink::open(path, chunk_size)?;
-        Self::start_with_sink(Box::new(sink), queue, sync_on_close, path)
+    pub fn start(options: WriterOptions) -> anyhow::Result<Self> {
+        let sink = Sink::open(&options)?;
+        Self::start_with_sink(
+            Box::new(sink),
+            options.queue,
+            options.sync_on_close,
+            &options.path,
+        )
     }
 
     /// Start the writer thread over an injected sink. Production callers pass
@@ -179,6 +721,9 @@ impl WriterHandle {
                             writer_counters
                                 .bytes
                                 .store(sink.bytes_written(), Ordering::Relaxed);
+                            writer_counters
+                                .segments
+                                .store(sink.segments(), Ordering::Relaxed);
                         }
                         WriterCommand::Flush(ack) => {
                             let result = sink.flush().map_err(|error| format!("{error:#}"));
@@ -190,6 +735,9 @@ impl WriterHandle {
                             writer_counters
                                 .bytes
                                 .store(sink.bytes_written(), Ordering::Relaxed);
+                            writer_counters
+                                .segments
+                                .store(sink.segments(), Ordering::Relaxed);
                             let _ = ack.send(result);
                         }
                         WriterCommand::Shutdown(ack) => {
@@ -205,6 +753,9 @@ impl WriterHandle {
                             writer_counters
                                 .bytes
                                 .store(sink.bytes_written(), Ordering::Relaxed);
+                            writer_counters
+                                .segments
+                                .store(sink.segments(), Ordering::Relaxed);
                             let _ = ack.send(result);
                             explicit_shutdown = true;
                             break;
@@ -228,6 +779,12 @@ impl WriterHandle {
                         set_fatal(&writer_fatal, &text);
                         writer_counters.errors.fetch_add(1, Ordering::Relaxed);
                     }
+                    writer_counters
+                        .bytes
+                        .store(sink.bytes_written(), Ordering::Relaxed);
+                    writer_counters
+                        .segments
+                        .store(sink.segments(), Ordering::Relaxed);
                 }
             })
             .context("spawning SBE writer thread")?;
@@ -449,6 +1006,15 @@ impl WriterHandle {
             .and_then(|slot| slot.clone())
             .unwrap_or_else(|| "no writer error recorded".to_owned())
     }
+
+    /// True while no fatal write, flush, finish, or sync error is recorded.
+    #[must_use]
+    pub fn healthy(&self) -> bool {
+        self.fatal
+            .lock()
+            .map(|slot| slot.is_none())
+            .unwrap_or(false)
+    }
 }
 
 fn set_fatal(slot: &Arc<Mutex<Option<String>>>, error: &str) {
@@ -467,11 +1033,11 @@ pub struct DirectWriter {
 }
 
 impl DirectWriter {
-    pub fn create(path: &str, chunk_size: usize, sync_on_close: bool) -> anyhow::Result<Self> {
+    pub fn create(options: WriterOptions) -> anyhow::Result<Self> {
         Ok(Self {
-            sink: Sink::open(path, chunk_size)?,
+            sink: Sink::open(&options)?,
             counters: WriterCounters::default(),
-            sync_on_close,
+            sync_on_close: options.sync_on_close,
         })
     }
 
@@ -481,6 +1047,9 @@ impl DirectWriter {
         self.counters
             .bytes
             .store(MessageSink::bytes_written(&self.sink), Ordering::Relaxed);
+        self.counters
+            .segments
+            .store(MessageSink::segments(&self.sink), Ordering::Relaxed);
         Ok(())
     }
 
@@ -490,6 +1059,9 @@ impl DirectWriter {
         self.counters
             .bytes
             .store(MessageSink::bytes_written(&self.sink), Ordering::Relaxed);
+        self.counters
+            .segments
+            .store(MessageSink::segments(&self.sink), Ordering::Relaxed);
         Ok(())
     }
 
@@ -502,6 +1074,9 @@ impl DirectWriter {
         self.counters
             .bytes
             .store(MessageSink::bytes_written(&self.sink), Ordering::Relaxed);
+        self.counters
+            .segments
+            .store(MessageSink::segments(&self.sink), Ordering::Relaxed);
         Ok(self.counters.snapshot())
     }
 
@@ -522,6 +1097,26 @@ mod tests {
 
     const TINY_TIMEOUT: Duration = Duration::from_millis(100);
     const PATIENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+    fn options(
+        path: &str,
+        chunk_size: usize,
+        queue: usize,
+        sync: bool,
+        overwrite: bool,
+    ) -> WriterOptions {
+        WriterOptions {
+            path: path.to_owned(),
+            chunk_size,
+            queue,
+            sync_on_close: sync,
+            overwrite,
+            rotate_bytes: 0,
+            rotate_secs: 0,
+            min_free_bytes: 0,
+            fsync_interval_secs: 0,
+        }
+    }
 
     fn update(symbol: &str) -> OutputMessage {
         let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
@@ -593,6 +1188,10 @@ mod tests {
         }
 
         fn bytes_written(&self) -> u64 {
+            0
+        }
+
+        fn segments(&self) -> u64 {
             0
         }
     }
@@ -733,12 +1332,13 @@ mod tests {
         // Give the reader thread a moment to reach open().
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let writer = WriterHandle::start(
+        let writer = WriterHandle::start(options(
             fifo.to_str().unwrap(),
             1024,
             128,
             true, // sync on close; the drain path must sync too
-        )
+            true, // the FIFO already exists; explicit overwrite is required
+        ))
         .unwrap();
 
         // Fill the queue: keep sending until the bounded queue rejects.
@@ -811,6 +1411,15 @@ mod tests {
         assert_eq!(stats.errors, 0);
     }
 
+    #[test]
+    fn exclusive_creation_does_not_truncate_an_existing_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("existing.sbe");
+        std::fs::write(&path, b"previous capture").unwrap();
+        assert!(crate::util::AlignedSbeWriter::create_new(&path, 4096).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous capture");
+    }
+
     #[tokio::test]
     async fn flush_makes_output_visible_to_reader() {
         // Output-visibility contract: accepted messages reach the file after
@@ -820,7 +1429,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("visible.sbe");
         let path = path.to_str().unwrap();
-        let writer = WriterHandle::start(path, 4096, 16, false).unwrap();
+        let writer = WriterHandle::start(options(path, 4096, 16, false, false)).unwrap();
         for i in 0..3 {
             writer
                 .send(update(&format!("sym-{i}")), TINY_TIMEOUT)
@@ -863,7 +1472,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("template-default.sbe");
         let path_str = path.to_str().unwrap();
-        let writer = WriterHandle::start(path_str, TEMPLATE_CHUNK, 16, false).unwrap();
+        let writer =
+            WriterHandle::start(options(path_str, TEMPLATE_CHUNK, 16, false, false)).unwrap();
         for i in 0..3 {
             writer
                 .send(update(&format!("sym-{i}")), TINY_TIMEOUT)
@@ -912,10 +1522,184 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let writer = WriterHandle::start(fifo.to_str().unwrap(), 1024, 16, true).unwrap();
+        let writer =
+            WriterHandle::start(options(fifo.to_str().unwrap(), 1024, 16, true, true)).unwrap();
         writer.send(update("fifo"), TINY_TIMEOUT).await.unwrap();
         writer.flush(PATIENT_TIMEOUT).await.unwrap();
         writer.shutdown(PATIENT_TIMEOUT).await.unwrap();
         assert!(reader.await.unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn rotation_finalizes_independently_verifiable_segments() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("rotated.sbe");
+        let mut writer_options = options(output.to_str().unwrap(), 1024, 16, true, false);
+        writer_options.rotate_bytes = 1024;
+        let writer = WriterHandle::start(writer_options).unwrap();
+        for index in 0..100 {
+            writer
+                .send(update(&format!("sym-{index}")), TINY_TIMEOUT)
+                .await
+                .unwrap();
+        }
+        let stats = writer.shutdown_with_stats(PATIENT_TIMEOUT).await.unwrap();
+        assert!(
+            stats.segments >= 2,
+            "expected at least two segments, got {}",
+            stats.segments
+        );
+
+        let manifest_path = rotation_manifest_path(output.to_str().unwrap());
+        let manifest: SegmentManifest =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert!(manifest.complete);
+        assert_eq!(manifest.segments.len() as u64, stats.segments);
+        assert_eq!(manifest.chunk_size, 1024);
+
+        let mut decoded = 0usize;
+        for entry in &manifest.segments {
+            let path = directory.path().join(&entry.file);
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(bytes.len() as u64, entry.bytes);
+            assert_eq!(crate::util::sha256_hex(&bytes), entry.sha256);
+            assert_eq!(bytes.len() % 1024, 0, "segments stay chunk-aligned");
+            let mut reader =
+                AlignedSbeReader::<OrderbookSchema>::open_with_chunk_size(&path, 1024).unwrap();
+            while reader.read_msg().unwrap().is_some() {
+                decoded += 1;
+            }
+        }
+        assert_eq!(decoded, 100);
+        // No temporary segment survives a clean finalization.
+        for entry in std::fs::read_dir(directory.path()).unwrap().flatten() {
+            assert!(
+                !entry.file_name().to_string_lossy().ends_with(".partial"),
+                "unfinalized segment left behind: {}",
+                entry.path().display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rotation_does_not_reuse_a_partial_segment_from_an_interrupted_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("crash.sbe");
+        let partial = directory.path().join("crash.sbe.000000.sbe.partial");
+        std::fs::write(&partial, b"interrupted").unwrap();
+        let mut writer_options = options(output.to_str().unwrap(), 1024, 16, false, false);
+        writer_options.rotate_bytes = 1024;
+        let error = WriterHandle::start(writer_options)
+            .err()
+            .expect("an interrupted segment must not be adopted");
+        assert!(
+            format!("{error:#}").contains("rotation segment"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(std::fs::read(&partial).unwrap(), b"interrupted");
+
+        let mut writer_options = options(output.to_str().unwrap(), 1024, 16, false, true);
+        writer_options.rotate_bytes = 1024;
+        let writer = WriterHandle::start(writer_options).unwrap();
+        writer.send(update("sym"), TINY_TIMEOUT).await.unwrap();
+        writer.shutdown(PATIENT_TIMEOUT).await.unwrap();
+        assert!(
+            !partial.exists(),
+            "explicit overwrite must discard the interrupted staging file"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_refuses_existing_segments_without_overwrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("rotated.sbe");
+        std::fs::write(directory.path().join("rotated.sbe.000000.sbe"), b"old").unwrap();
+        let mut writer_options = options(output.to_str().unwrap(), 1024, 16, false, false);
+        writer_options.rotate_bytes = 1024;
+        let error = WriterHandle::start(writer_options)
+            .err()
+            .expect("existing segment must be rejected");
+        assert!(
+            format!("{error:#}").contains("already exists"),
+            "unexpected error: {error:#}"
+        );
+
+        let mut writer_options = options(output.to_str().unwrap(), 1024, 16, false, true);
+        writer_options.rotate_bytes = 1024;
+        let writer = WriterHandle::start(writer_options).unwrap();
+        writer.send(update("sym"), TINY_TIMEOUT).await.unwrap();
+        writer.shutdown(PATIENT_TIMEOUT).await.unwrap();
+        assert!(
+            !directory.path().join("rotated.sbe.000001.sbe").exists(),
+            "explicit overwrite starts a fresh segment namespace"
+        );
+    }
+
+    #[test]
+    fn cleanup_matches_only_owned_rotation_artifacts() {
+        assert!(rotation_artifact_name(
+            "capture.sbe.",
+            "capture.sbe.000001.sbe"
+        ));
+        assert!(rotation_artifact_name(
+            "capture.sbe.",
+            "capture.sbe.000001.sbe.partial"
+        ));
+        assert!(!rotation_artifact_name(
+            "capture.sbe.",
+            "capture.sbe.backup.sbe"
+        ));
+        assert!(!rotation_artifact_name(
+            "capture.sbe.",
+            "capture.sbe.000001.log"
+        ));
+    }
+
+    #[tokio::test]
+    async fn time_rotation_starts_a_new_segment_after_the_interval() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("timed.sbe");
+        let mut writer_options = options(output.to_str().unwrap(), 1024, 16, true, false);
+        writer_options.rotate_secs = 1;
+        let writer = WriterHandle::start(writer_options).unwrap();
+        writer.send(update("first"), TINY_TIMEOUT).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        writer.send(update("second"), TINY_TIMEOUT).await.unwrap();
+        let stats = writer.shutdown_with_stats(PATIENT_TIMEOUT).await.unwrap();
+        assert_eq!(stats.segments, 2);
+    }
+
+    #[tokio::test]
+    async fn watermark_failure_stops_the_writer_before_the_disk_fills() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("watermark.sbe");
+        let mut writer_options = options(output.to_str().unwrap(), 4096, 16, false, false);
+        writer_options.min_free_bytes = u64::MAX;
+        let writer = WriterHandle::start(writer_options).unwrap();
+        let _ = writer.send(update("sym"), TINY_TIMEOUT).await;
+        wait_for_fatal(&writer).await;
+        let error = writer.shutdown(PATIENT_TIMEOUT).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("min_free_bytes"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn periodic_fsync_does_not_pad_the_active_chunk() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("fsync.sbe");
+        let mut writer_options = options(output.to_str().unwrap(), 4096, 16, false, false);
+        writer_options.fsync_interval_secs = 1;
+        let writer = WriterHandle::start(writer_options).unwrap();
+        writer.send(update("sym"), TINY_TIMEOUT).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        writer.flush(PATIENT_TIMEOUT).await.unwrap();
+        let visible = std::fs::metadata(&output).unwrap().len();
+        assert!(
+            visible > 0 && visible < 4096,
+            "periodic fsync must not pad a whole chunk, saw {visible} bytes"
+        );
+        writer.shutdown(PATIENT_TIMEOUT).await.unwrap();
     }
 }

@@ -13,7 +13,7 @@ pub use session::{PolymarketExchange, PolymarketSessionFactory};
 
 use crate::{
     config::{NetworkSettings, PolymarketSettings},
-    exchange::Exchange,
+    exchange::{DiscoveryResult, Exchange},
     model::MarketInfo,
     session::SessionFactory,
 };
@@ -29,6 +29,13 @@ impl Exchange for PolymarketExchange {
     }
 
     async fn discover_markets(&self, max_markets: usize) -> anyhow::Result<Vec<MarketInfo>> {
+        Ok(self.fetch_markets(max_markets).await?.markets)
+    }
+
+    async fn discover_markets_with_stats(
+        &self,
+        max_markets: usize,
+    ) -> anyhow::Result<DiscoveryResult> {
         self.fetch_markets(max_markets).await
     }
 

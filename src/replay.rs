@@ -132,16 +132,13 @@ fn default_reset_reason() -> String {
 /// Run one fixture through the collector core and write the SBE output.
 pub fn run(settings: Settings, input: &Path) -> anyhow::Result<RunReport> {
     settings.validate()?;
+    crate::config::preflight_output(&settings)?;
     let mut replay_settings = settings.clone();
     replay_settings.collector.shards = 1;
     replay_settings.collector.replicas = replay_settings.collector.replicas.max(2);
     let core_config = CoreConfig::from_settings(&replay_settings, 1)?;
     let mut core = CollectorCore::new(core_config)?;
-    let mut writer = DirectWriter::create(
-        &settings.output.path,
-        settings.output.chunk_size,
-        settings.output.sync_on_close,
-    )?;
+    let mut writer = DirectWriter::create(crate::writer::WriterOptions::from_settings(&settings))?;
 
     let reader: Box<dyn BufRead> = if input.as_os_str() == "-" {
         Box::new(BufReader::new(std::io::stdin()))
@@ -366,7 +363,7 @@ pub fn run(settings: Settings, input: &Path) -> anyhow::Result<RunReport> {
     writer.flush()?;
     let writer_stats = writer.shutdown()?;
     let core_stats = core.stats();
-    let report = RunReport::new(
+    let mut report = RunReport::new(
         "replay",
         &settings.exchange.to_string(),
         "fixture",
@@ -383,6 +380,13 @@ pub fn run(settings: Settings, input: &Path) -> anyhow::Result<RunReport> {
         core.statuses().values().cloned().collect(),
         ReportConfig::from_settings(&settings, 1),
     );
+    if crate::writer::WriterOptions::from_settings(&settings).rotation_enabled() {
+        report.output_manifest = Some(
+            crate::config::rotation_manifest_path(&settings.output.path)
+                .display()
+                .to_string(),
+        );
+    }
     if let Some(path) = sidecar_path(&settings.output.metadata_path) {
         MarketMetadata::new(&settings.exchange.to_string(), core.market_infos())
             .write(path)

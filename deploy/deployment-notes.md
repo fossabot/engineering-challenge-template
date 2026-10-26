@@ -8,16 +8,17 @@ cargo build --release --locked
 
 # Install
 sudo install -m 755 target/release/engineering-challenge /usr/local/bin/
+sudo useradd --system --home-dir /var/lib/engineering-challenge --shell /usr/sbin/nologin collector
 sudo mkdir -p /etc/engineering-challenge
 sudo install -m 644 config.example.toml /etc/engineering-challenge/settings.toml
+sudo install -d -o collector -g collector /var/lib/engineering-challenge /var/log/engineering-challenge
 ```
 
 ## Directory Layout
 
 ```
 /etc/engineering-challenge/
-  settings.toml          # Main configuration (root readable, collector writable)
-  catalog.json           # Warm catalog checkpoint (written by collector)
+  settings.toml          # Main configuration (root readable)
 
 /var/lib/engineering-challenge/
   capture.sbe            # Primary SBE output (rotated segments here)
@@ -75,7 +76,7 @@ final_snapshots = true
 
 [output]
 path = "/var/lib/engineering-challenge/capture.sbe"
-chunk_size = 16384
+chunk_size = 67108864           # 64 MiB; template-reader compatible
 rotate_bytes = 1073741824     # 1 GiB segments
 rotate_secs = 3600            # 1 hour max segment age
 min_free_bytes = 10737418240  # 10 GiB watermark

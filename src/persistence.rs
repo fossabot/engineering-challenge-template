@@ -28,8 +28,12 @@ use crate::{
 /// Result of the most recent persistence attempt.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersistenceStatus {
-    /// Newest generation accepted by the worker.
+    /// Backwards-compatible alias for `submitted_generation`.
     pub generation: u64,
+    /// Newest generation accepted from the coordinator.
+    pub submitted_generation: u64,
+    /// Newest generation whose write attempt completed.
+    pub completed_generation: u64,
     /// A newer snapshot is waiting for the writer.
     pub pending: bool,
     pub last_success_us: Option<i64>,
@@ -66,10 +70,27 @@ struct Inner {
     hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
+/// Kept only by public handles, never by the worker. Its final drop is the
+/// reliable owner-loss signal; counting `Inner` references cannot work because
+/// the worker necessarily owns one while it is waiting.
+struct Owner {
+    inner: Arc<Inner>,
+}
+
+impl Drop for Owner {
+    fn drop(&mut self) {
+        if let Ok(mut queue) = self.inner.queue.lock() {
+            queue.shutdown = true;
+            self.inner.wake.notify_all();
+        }
+    }
+}
+
 /// Handle used by the coordinator. Cloning shares the same worker and status.
 #[derive(Clone)]
 pub struct PersistenceHandle {
     inner: Arc<Inner>,
+    _owner: Arc<Owner>,
     done: Arc<Mutex<Option<Receiver<()>>>>,
     join: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
     shutdown: Arc<Mutex<bool>>,
@@ -111,6 +132,9 @@ impl PersistenceHandle {
             })
             .context("spawning persistence worker")?;
         Ok(Self {
+            _owner: Arc::new(Owner {
+                inner: Arc::clone(&inner),
+            }),
             inner,
             done: Arc::new(Mutex::new(Some(done_rx))),
             join: Arc::new(Mutex::new(Some(join))),
@@ -181,7 +205,7 @@ impl PersistenceHandle {
             .status
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .generation
+            .submitted_generation
             .saturating_add(1);
         queue.pending = Some(Job {
             generation,
@@ -193,6 +217,7 @@ impl PersistenceHandle {
         {
             let mut status = self.inner.status.lock().unwrap_or_else(|e| e.into_inner());
             status.generation = generation;
+            status.submitted_generation = generation;
             status.pending = true;
         }
         self.inner.wake.notify_one();
@@ -212,7 +237,17 @@ impl PersistenceHandle {
     pub fn shutdown(&self, timeout: Duration) -> anyhow::Result<()> {
         let mut already = self.shutdown.lock().unwrap_or_else(|e| e.into_inner());
         if *already {
-            return Ok(());
+            // A prior bounded attempt may have timed out. It signalled the
+            // worker but did not join it, so a later call must retry rather
+            // than falsely reporting a clean shutdown.
+            if self
+                .join
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none()
+            {
+                return Ok(());
+            }
         }
         *already = true;
         drop(already);
@@ -222,8 +257,8 @@ impl PersistenceHandle {
             queue.shutdown = true;
             self.inner.wake.notify_all();
         }
-        let done = self.done.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(done) = done {
+        let mut done_guard = self.done.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(done) = done_guard.as_ref() {
             match done.recv_timeout(timeout) {
                 Ok(()) => {}
                 Err(_) => anyhow::bail!(
@@ -232,23 +267,13 @@ impl PersistenceHandle {
                 ),
             }
         }
+        // Retire the completion receiver only after it actually completed.
+        done_guard.take();
+        drop(done_guard);
         if let Some(join) = self.join.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = join.join();
         }
         Ok(())
-    }
-}
-
-impl Drop for PersistenceHandle {
-    fn drop(&mut self) {
-        // The coordinator calls `shutdown`; this only wakes a worker if the
-        // last handle is dropped during an error path.
-        if Arc::strong_count(&self.inner) == 1
-            && let Ok(mut queue) = self.inner.queue.lock()
-        {
-            queue.shutdown = true;
-            self.inner.wake.notify_all();
-        }
     }
 }
 
@@ -285,8 +310,10 @@ fn worker_loop(inner: Arc<Inner>) {
                 status.last_error = Some(format!("{error:#}"));
             }
         }
-        status.generation = job.generation;
-        status.pending = false;
+        status.completed_generation = status.completed_generation.max(job.generation);
+        // A later generation can have been accepted while this job was in
+        // flight. It remains pending and must never be reported as completed.
+        status.pending = status.completed_generation < status.submitted_generation;
         drop(status);
         if let Some(ack) = job.ack {
             let _ = ack.send(result.map(|_| ()).map_err(|error| format!("{error:#}")));

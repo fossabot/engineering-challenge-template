@@ -40,7 +40,7 @@ impl Catalog {
         markets: Vec<MarketInfo>,
         generated_at_us: i64,
     ) -> anyhow::Result<Self> {
-        let checksum = checksum_for(exchange, &markets)?;
+        let checksum = checksum_for(exchange, generated_at_us, &markets)?;
         let selected_markets = count_selected_markets(&markets);
         let catalog = Self {
             schema_version: CATALOG_SCHEMA_VERSION,
@@ -82,7 +82,7 @@ impl Catalog {
                 .validate()
                 .with_context(|| format!("invalid catalog market `{}`", market.symbol))?;
         }
-        let expected = checksum_for(&self.exchange, &self.markets)?;
+        let expected = checksum_for(&self.exchange, self.generated_at_us, &self.markets)?;
         anyhow::ensure!(
             self.checksum == expected,
             "catalog checksum mismatch: stored {}, computed {expected}",
@@ -114,8 +114,13 @@ impl Catalog {
 }
 
 /// SHA-256 over the exchange name and a canonical compact JSON market list.
-pub fn checksum_for(exchange: &str, markets: &[MarketInfo]) -> anyhow::Result<String> {
-    let bytes = serde_json::to_vec(&(exchange, markets)).context("serializing catalog checksum")?;
+pub fn checksum_for(
+    exchange: &str,
+    generated_at_us: i64,
+    markets: &[MarketInfo],
+) -> anyhow::Result<String> {
+    let bytes = serde_json::to_vec(&(exchange, generated_at_us, markets))
+        .context("serializing catalog checksum")?;
     Ok(sha256_hex(&bytes))
 }
 
@@ -173,6 +178,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_modified_generation_timestamp() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalog.json");
+        Catalog::new("polymarket", vec![market(0)], 1_000)
+            .unwrap()
+            .save(&path)
+            .unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        value["generated_at_us"] = serde_json::json!(9_999_999);
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(
+            Catalog::load(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("checksum")
+        );
+    }
+
+    #[test]
     fn rejects_count_mismatch_and_unknown_schema() {
         let mut catalog = Catalog::new("polymarket", vec![market(0)], 1_000).unwrap();
         catalog.outcome_symbols = 2;
@@ -187,8 +212,8 @@ mod tests {
     fn checksum_is_exchange_specific() {
         let markets = vec![market(0)];
         assert_ne!(
-            checksum_for("polymarket", &markets).unwrap(),
-            checksum_for("kalshi", &markets).unwrap()
+            checksum_for("polymarket", 1_000, &markets).unwrap(),
+            checksum_for("kalshi", 1_000, &markets).unwrap()
         );
     }
 }

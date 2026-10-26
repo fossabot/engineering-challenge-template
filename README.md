@@ -52,19 +52,20 @@ cargo test --doc --locked
 cargo build --release --locked
 ```
 
-This branch's most recent run has **139 passing offline tests**: 130 library
-tests, 7 mock-exchange end-to-end tests, and 2 replay integration tests, plus
-2 opt-in live tests. The branch's commands, counts, and CI/live run links are
-recorded in
+This branch's most recent run has **181 passing offline tests**: 169 library
+tests, 8 mock-exchange end-to-end tests, 2 replay integration tests, 2 opt-in
+scale tests (1k/5k/25k/100k), plus 2 opt-in live tests. The branch's commands,
+counts, and CI/live run links are recorded in
 [`docs/correctness-audit-2026-10-26.md`](docs/correctness-audit-2026-10-26.md);
 the submitted baseline's 127-test run is recorded in
 [`docs/final-verification-2026-10-25.md`](docs/final-verification-2026-10-25.md).
 
 The offline suite covers decoding, fixed-point arithmetic, order books,
 sharding/failover/snapshot scheduling, maintenance clock resets, malformed
-discovery rejection, SBE sentinel validation, an end-to-end replay fixture, and
-a loopback mock exchange that drives the real coordinator, adapters, sessions,
-writer, and SBE reader. The public Polymarket network test is opt-in:
+discovery rejection, SBE sentinel validation, an end-to-end replay fixture, a
+loopback mock exchange that drives the real coordinator, adapters, sessions,
+writer, and SBE reader, and a scale harness that exercises 1,000–100,000
+symbols. The public Polymarket network test is opt-in:
 
 ```bash
 RUN_LIVE_TESTS=1 cargo test --test live_polymarket -- --ignored --nocapture
@@ -238,6 +239,19 @@ valid and, if clocks are available, not older than the last emitted state. This
 prevents a stale backup from silently regressing the output. If no backup is
 ready, the core requests fresh snapshots and waits.
 
+`collector.max_markets` counts selected venue market records: Gamma records for
+Polymarket and market tickers for Kalshi. One Polymarket record can contribute
+several outcome tokens, and the cap is applied between records so a condition's
+outcome set is never split. Discovery telemetry reports selected records and
+outcome symbols separately.
+
+Before any socket opens, the coordinator builds a capacity plan from the
+selected universe. The plan derives or validates the shard count, then rejects a
+run whose total connections, largest initial subscription frame, estimated book
+memory, or estimated snapshot rate exceeds its configured ceiling. The plan is
+written to the run report. These are planning bounds, not measured claims; see
+`docs/operating-envelope.md`.
+
 ### Snapshot policy
 
 - First exchange snapshot for a symbol is written immediately.
@@ -317,19 +331,82 @@ Two optional JSON sidecars are written atomically:
   title/outcome, close time, tick size, full `price_ranges`, and the
   human-readable `price_level_structure` when supplied.
 - `--report`: run mode, environment, start/end timestamps, shutdown reason,
-  non-secret configuration, core counters, writer counters, and final source
+  non-secret configuration, capacity plan, discovery telemetry, catalog source,
+  persistence result, coverage gauges, writer counters, and final source
   status.
 
-## Metrics
+Existing capture, metadata, report, catalog, manifest, and segment files are
+startup errors. `output.overwrite = true` (or `--overwrite`) is required to
+replace them. The check runs before discovery or writer creation, so a rejected
+startup leaves the previous run untouched.
+
+### Rotation and durability
+
+`output.rotate_bytes` and `output.rotate_secs` bound each segment by size or
+time. Rotation happens only between messages, so a message is never split.
+Segments are staged as `<path>.<sequence>.sbe.partial`, finalized with a
+SHA-256 checksum, fsynced, and atomically renamed to `<path>.<sequence>.sbe`.
+Each finalization updates `<path>.manifest.json`, which records the schema
+version, chunk size, creation time, completion flag, segment names, byte counts,
+checksums, and finalization times. The run report carries the manifest path.
+
+`output.min_free_bytes` stops the writer before the output filesystem fills.
+The watermark is checked with `df -Pk` at most once every five seconds.
+`output.fsync_interval_secs` periodically persists the active file without
+padding its final chunk; zero syncs only on rotation and shutdown.
+
+`inspect` and `verify` operate on one aligned file. For a rotated capture,
+run them on each finalized segment independently or concatenate segments only
+when the consumer can start decoding at a message boundary. The manifest is the
+authority for segment order and integrity.
+
+### Catalog checkpoints
+
+`collector.catalog_path` persists the last complete, accepted discovery round as
+a versioned JSON checkpoint with the exchange name, generation time, selected
+record and outcome counts, and a SHA-256 digest over the market list. A
+checkpoint is written only after a full discovery round has been accepted; a
+partial page set, repeated cursor, or failed validation never replaces it.
+
+`collector.catalog_mode` selects startup behavior:
+
+| Mode | Behavior |
+|---|---|
+| `off` | Always discover; never read a checkpoint. |
+| `warm` | Use a fresh, verified checkpoint, otherwise discover. |
+| `require` | Require a fresh, verified checkpoint; fail startup otherwise. |
+| `stale` | Require any verified, non-empty checkpoint regardless of age. |
+
+A checkpoint from another exchange, with a failed checksum, an invalid market,
+or a count mismatch is rejected. `warm` falls back to discovery; `require` and
+`stale` fail startup. A warm checkpoint's generation time is preserved across
+metadata writes, so a restart cannot make an old catalog look fresh.
+
+## Metrics and readiness
 
 ```bash
 cargo run --release -- --metrics-listen 127.0.0.1:9090 ...
 curl -s http://127.0.0.1:9090/metrics
 curl -s http://127.0.0.1:9090/healthz
+curl -s http://127.0.0.1:9090/livez
+curl -s http://127.0.0.1:9090/readyz
 ```
 
-Metrics include symbols, snapshots, deltas, rejected deltas, sequence resets,
-source switches, stale probes, writer queue depth, bytes, and per-source status.
+Metrics include symbols, anchored and stale symbols, expected and sent
+subscriptions, shard/source coverage, snapshots, deltas, rejected deltas,
+sequence resets, source switches, stale probes, writer queue depth, bytes,
+segments, persistence state, catalog and discovery ages, discovery page/record/
+outcome/malformed/retry counters, readiness, and per-source status.
+
+`/livez` reports process liveness and stays `200` while the HTTP server can
+answer. `/readyz` returns `200` only when every invariant holds and `503`
+otherwise, with a JSON check for each: writer health and zero write errors,
+source coverage on every shard, anchored-symbol fraction, stale books, catalog
+age, persistence failure, and fatal state. `/healthz` remains source-oriented
+and includes the readiness boolean.
+
+`docs/metric-runbook.md` lists the alert signals and the first diagnostic step
+for each.
 
 ## Replay, inspection, and verification
 
@@ -481,6 +558,19 @@ settings:
 | `collector.final_snapshots` | true | Final snapshots on shutdown |
 | `collector.writer_queue` | 16384 | Bounded writer queue |
 | `collector.flush_interval_secs` | 1 | Output-visibility bound: every interval with traffic ends with an unpadded flush, so a downstream reader sees an accepted delta within about one second |
+| `collector.max_markets` | 0 | Cap on selected venue market records; one Polymarket record keeps its full outcome set |
+| `collector.max_total_connections` | 64 | Startup ceiling on `shards * replicas` sockets |
+| `collector.max_initial_subscription_bytes` | 1048576 | Startup ceiling on the largest initial subscription frame |
+| `collector.max_estimated_book_memory_mb` | 1024 | Startup ceiling on estimated resident book memory |
+| `collector.max_snapshot_bytes_per_sec` | 16777216 | Startup ceiling on estimated snapshot output |
+| `collector.connect_concurrency` | 8 | Maximum simultaneous websocket handshakes across all workers |
+| `collector.catalog_path` | none | Last-known-good discovery checkpoint |
+| `collector.catalog_mode` | `off` | `off`, `warm`, `require`, or `stale` |
+| `collector.catalog_max_age_secs` | 3600 | Maximum accepted age for `warm` and `require` |
+| `collector.allow_empty_catalog` | false | Accept a complete discovery round that retires every symbol |
+| `collector.readiness_min_anchored_fraction` | 0.99 | Minimum anchored-symbol fraction for `/readyz` |
+| `collector.readiness_max_catalog_age_secs` | 3600 | Maximum catalog age for `/readyz` |
+| `collector.readiness_max_stale_secs` | 120 | Maximum time since a book's last valid update for `/readyz` |
 | `network.tcp_nodelay` | true | `TCP_NODELAY` on every websocket socket |
 | `network.source_ip` | none | Local IP to bind before connecting |
 | `network.source_port` | none | Base local source port; connection `shard*256+replica` binds `base + ordinal`; not combinable with `connect_race > 1` |
@@ -489,6 +579,11 @@ settings:
 | `polymarket.discovery_page_size` | 100 | Gamma keyset page size; the endpoint accepts at most 100 |
 | `polymarket.require_accepting_orders` | true | Only an explicit `acceptingOrders == true` is tradable |
 | `output.chunk_size` | 67108864 | Power-of-two chunk; defaults to 64 MiB for template-reader compatibility. Padding is written only on chunk rotation and at close |
+| `output.overwrite` | false | Replace existing capture, sidecars, catalog, manifest, and segments |
+| `output.rotate_bytes` | 0 | Size rotation threshold; zero disables it |
+| `output.rotate_secs` | 0 | Time rotation threshold; zero disables it |
+| `output.min_free_bytes` | 0 | Free-space watermark checked at most every five seconds |
+| `output.fsync_interval_secs` | 0 | Periodic fsync cadence; zero syncs only on rotation and shutdown |
 | `output.path` | `-` | File or binary stdout |
 
 ## Repository layout
@@ -497,12 +592,15 @@ settings:
 src/
   cli.rs              CLI definitions and overrides
   config.rs           TOML/env/CLI configuration and validation
+  capacity.rs         startup capacity plan and shard derivation
+  catalog.rs          versioned, checksummed discovery checkpoint
+  persistence.rs      latest-wins metadata/catalog writer
   coordinator.rs      live orchestration, discovery, signals, reports
   collector/state.rs  deterministic core, sharding, shadow books, failover
   exchange/kalshi/    auth, discovery, codec, websocket session
   exchange/polymarket/ Gamma keyset discovery, CLOB codec, websocket session
   session.rs          generic source supervisor
-  writer.rs           single serialized SBE writer
+  writer.rs           serialized SBE writer, rotation, watermark
   replay.rs           normalized JSONL replay
   inspect.rs          aligned SBE inspection
   verify.rs           capture self-consistency verification
@@ -513,13 +611,22 @@ src/
   util/               supplied aligned SBE helpers and generated DTOs
 fixtures/             deterministic replay fixture
 tests/                replay, opt-in live, and mock-exchange E2E tests
-docs/                 replay format, latency methodology, requirement matrix,
-                      and final verification evidence
+docs/                 replay format, latency methodology, operating envelope,
+                      metric runbook, requirement matrix, and verification evidence
+deploy/               deployment unit and operational notes
 measurements/         exact measured reports from public runs
 ```
 
 ## Known limitations and notes
 
+- The full Polymarket universe is not a supported default envelope. A measured
+  universe of 548,942 outcome tokens needs 110 sockets at 5,000 symbols per
+  socket, above the default `max_shards = 64`; the startup capacity gate rejects
+  that configuration. Raising the limits requires measured memory, network, and
+  output evidence for the target host.
+- The 24-hour continuous soak with injected faults has not been executed. The
+  mock scale runs and fault-injection tests cover bounded scenarios; see
+  `docs/operating-envelope.md` for the exact evidence and the remaining gate.
 - Kalshi live validation requires credentials that are not checked into this
   repository. The authenticated path is implemented and covered by codec/auth
   and mock-websocket tests; a live run is the next validation step once
