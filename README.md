@@ -591,31 +591,72 @@ settings:
 
 ```text
 src/
-  cli.rs              CLI definitions and overrides
-  config.rs           TOML/env/CLI configuration and validation
-  capacity.rs         startup capacity plan and shard derivation
-  catalog.rs          versioned, checksummed discovery checkpoint
-  persistence.rs      latest-wins metadata/catalog writer
-  coordinator.rs      live orchestration, discovery, signals, reports
-  collector/state.rs  deterministic core, sharding, shadow books, failover
-  exchange/kalshi/    auth, discovery, codec, websocket session
-  exchange/polymarket/ Gamma keyset discovery, CLOB codec, websocket session
-  session.rs          generic source supervisor
-  writer.rs           serialized SBE writer, rotation, watermark
-  replay.rs           normalized JSONL replay
-  inspect.rs          aligned SBE inspection
-  verify.rs           capture self-consistency verification
-  latency.rs          measured latency, connection setup, and cross-replica skew
-  report.rs           atomic run-report and metadata sidecars
-  time.rs             wall-clock timestamp helpers and conversions
-  ws.rs               websocket transport: TCP_NODELAY, source binding, racing
-  util/               supplied aligned SBE helpers and generated DTOs
-fixtures/             deterministic replay fixture
-tests/                replay, opt-in live, and mock-exchange E2E tests
-docs/                 replay format, latency methodology, operating envelope,
-                      metric runbook, requirement matrix, and verification evidence
-deploy/               deployment unit and operational notes
-measurements/         exact measured reports from public runs
+  cli.rs                      CLI definitions and overrides
+  config.rs                   TOML/env/CLI configuration and validation
+  capacity.rs                 startup capacity plan and shard derivation
+  catalog.rs                  versioned, checksummed discovery checkpoint
+  persistence.rs              latest-wins metadata/catalog writer
+  coordinator.rs              live orchestration, discovery, signals, reports
+  collector/
+    mod.rs                    collector module re-exports
+    state.rs                  deterministic core, sharding, shadow books, failover
+  exchange/
+    mod.rs                    exchange module re-exports
+    kalshi/
+      mod.rs                  Kalshi module re-exports
+      auth.rs                 Ed25519/RSA authentication and challenge signing
+      codec.rs                SBE decode: snapshots, deltas, lifecycle, control
+      discovery.rs            REST discovery with keyset pagination, filters, retry
+      session.rs              Kalshi websocket session, seq validation, reconnect
+    polymarket/
+      mod.rs                  Polymarket module re-exports
+      codec.rs                CLOB book/price_change decode, absolute sizes
+      discovery.rs            Gamma keyset discovery, outcome expansion, cursor cycle detection
+      session.rs              public CLOB websocket session, snapshot-driven recovery
+  fixed.rs                    fixed-point decimal (1e6) arithmetic and parsing
+  inspect.rs                  aligned SBE inspection CLI
+  latency.rs                  measured latency, connection setup, cross-replica skew
+  lib.rs                      crate root, public API, test modules
+  main.rs                     binary entry, command dispatch
+  metrics.rs                  Prometheus text exporter, /healthz, /readyz, /livez
+  model.rs                    core domain types: Symbol, Side, PriceLevel, Book
+  orderbook.rs                in-memory order book: apply snapshots/deltas, best bid/ask
+  replay.rs                   normalized JSONL replay through core state machine
+  report.rs                   atomic run-report and metadata sidecars
+  session.rs                  generic source supervisor: connect, heartbeat, controls, reconnect
+  side.rs                     Side::Buy/Side::Sell with serialization
+  time.rs                     wall-clock timestamp helpers and conversions
+  util/
+    mod.rs                    util module re-exports
+    aligned_sbe_reader.rs     chunk-aligned SBE reader with auto-detection
+    aligned_sbe_writer.rs     chunk-aligned SBE writer, padding, rotation
+    build.rs                  build-time SBE code generation from YAML
+    dtos.rs                   generated DTOs from supplied schema
+    orderbook_schema.rs       schema constants, template IDs
+    sbe_yaml.rs               schema YAML parsing for codegen
+  verify.rs                   capture self-consistency verification CLI
+  writer.rs                   serialized SBE writer, rotation, watermark, fsync
+  ws.rs                       websocket transport: TCP_NODELAY, source binding, racing
+fixtures/                     deterministic replay fixture (sample_replay.jsonl)
+tests/
+  e2e_mock_exchange.rs        loopback Gamma+CLOB mock exchange, 8 scenarios
+  live_polymarket.rs          opt-in live Polymarket public feed tests
+  replay_fixture.rs           deterministic fixture replay + verify integration
+docs/
+  architecture.md             source traceability matrix, Mermaid diagrams
+  correctness-audit-2026-10-26.md  test counts, CI run links, evidence
+  final-verification-2026-10-25.md baseline 127-test verification
+  integration-audit-2026-10-26.md  Phase 2 integration audit
+  latency.md                  Extension 4 methodology, caveats, raw data
+  metric-runbook.md           alert signals and first diagnostic step per metric
+  operating-envelope.md       planning bounds, derived shard count, defaults
+  replay-format.md            JSONL replay record schema
+  requirement-test-matrix.md  requirement-to-test traceability
+deploy/                       deployment unit and operational notes
+measurements/                 exact measured reports from public runs
+scripts/
+  check_architecture.py       architecture traceability gate (source files, tests, diagrams)
+  render_architecture_diagrams.py  Mermaid -> SVG diagram renderer
 ```
 
 ## Known limitations and notes
