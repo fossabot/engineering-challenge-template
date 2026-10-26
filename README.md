@@ -4,13 +4,19 @@ A Rust collector for live prediction-market order books. It writes the supplied
 FIX SBE schema, maintains a book per symbol, discovers markets continuously, and
 load-balances symbols across redundant websocket sources.
 
-Kalshi is the primary exchange adapter. Polymarket's public CLOB market channel
-is included as a working fallback and as a public, credential-free way to
-validate the transport, sharding, snapshot, replay, and inspection paths.
+Polymarket is the production-development focus. The current application is a
+market-data collector, not a complete trading system: authenticated order entry,
+account/position reconciliation, strategy evaluation, and independent pre-trade
+risk controls are not yet implemented. The Kalshi adapter remains part of the
+challenge baseline and regression surface.
 
 See the [requirement-to-test matrix](docs/requirement-test-matrix.md) and
 [final verification](docs/final-verification-2026-10-25.md) for the exact
 offline gate results.
+
+See the [Polymarket production programme](docs/production-roadmap-polymarket.md)
+for the target architecture, risk boundaries, staged implementation plan, and
+the evidence required before live order submission is enabled.
 
 ## What it does
 
