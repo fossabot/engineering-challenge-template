@@ -22,10 +22,10 @@ pub fn parse_micros(input: &str) -> anyhow::Result<i64> {
         bail!("empty fixed-point value");
     }
 
-    let (negative, unsigned) = match text.as_bytes()[0] {
-        b'-' => (true, &text[1..]),
-        b'+' => (false, &text[1..]),
-        _ => (false, text),
+    let (negative, unsigned) = if let Some(unsigned) = text.strip_prefix('-') {
+        (true, unsigned)
+    } else {
+        (false, text.strip_prefix('+').unwrap_or(text))
     };
     if unsigned.is_empty() {
         bail!("missing digits in fixed-point value `{input}`");
@@ -149,7 +149,19 @@ mod tests {
 
     #[test]
     fn rejects_inexact_or_malformed_values() {
-        for value in ["", ".", "1.0000001", "1e-3", "1,000", "nan", "--1"] {
+        for value in [
+            "",
+            ".",
+            "-",
+            "+",
+            "1.0000001",
+            "1e-3",
+            "1,000",
+            "nan",
+            "--1",
+            "−1",
+            "１２",
+        ] {
             assert!(parse_micros(value).is_err(), "{value} should be rejected");
         }
     }

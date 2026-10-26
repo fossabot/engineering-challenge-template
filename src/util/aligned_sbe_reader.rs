@@ -27,6 +27,17 @@ const DEFAULT_CHUNK_SIZE: usize = 64 << 20; // 64MiB
 // Every schema in `dtos` uses the standard eight-byte SBE message header.
 const HEADER_LENGTH: usize = 8;
 
+/// A chunk is always addressable as `usize`; clamp a larger file remainder to
+/// the configured chunk instead of relying on a conversion invariant.
+fn chunk_take(remaining: u64, chunk: usize) -> usize {
+    usize::try_from(remaining).map_or(chunk, |value| value.min(chunk))
+}
+
+fn widen(length: usize) -> u64 {
+    // Rust targets guarantee `usize` is no wider than `u64`.
+    length as u64
+}
+
 /// See [`AlignedSbeReader::create_prefetch_task`] for more details.
 pub type PrefetchTask = Box<dyn FnOnce() + Send + 'static>;
 
@@ -143,8 +154,7 @@ impl<T: AlignedSbeSchema> AlignedSbeReader<T> {
                     let _ = ready_chunks_tx.send(Ok(None));
                     return;
                 }
-                let take = usize::try_from(remaining.min(chunk_size as u64))
-                    .expect("chunk size fits usize");
+                let take = chunk_take(remaining, chunk_size);
 
                 let mut buffer = match spare_buffers.next() {
                     Some(buffer) => buffer,
@@ -162,7 +172,7 @@ impl<T: AlignedSbeSchema> AlignedSbeReader<T> {
                 if ready_chunks_tx.send(Ok(Some(buffer))).is_err() {
                     return;
                 }
-                file_offset += take as u64;
+                file_offset = file_offset.saturating_add(widen(take));
             }
         }))
     }
@@ -208,8 +218,7 @@ impl<T: AlignedSbeSchema> AlignedSbeReader<T> {
             self.eof = true;
             return Ok(false);
         }
-        let take =
-            usize::try_from(remaining.min(self.chunk_size as u64)).expect("chunk size fits usize");
+        let take = chunk_take(remaining, self.chunk_size);
         self.buffer.resize(take, 0);
         ChunkSource::read_exact_at(
             self.file.as_ref().context("file moved to prefetch task")?,
@@ -217,7 +226,7 @@ impl<T: AlignedSbeSchema> AlignedSbeReader<T> {
             &mut self.buffer,
         )?;
 
-        self.file_offset += take as u64;
+        self.file_offset = self.file_offset.saturating_add(widen(take));
         self.buffer_pos = 0;
         if self.file_offset >= self.file_len {
             self.eof = true;
@@ -375,8 +384,7 @@ fn validate_aligned_source<T: AlignedSbeSchema, S: ChunkSource>(
     let mut total = 0usize;
     let mut start = 0u64;
     while start < len {
-        let take = usize::try_from((len - start).min(chunk as u64))
-            .expect("chunk size fits usize after the detection cap");
+        let take = chunk_take(len - start, chunk);
         buffer.resize(take, 0);
         source
             .read_exact_at(start, buffer)
@@ -424,7 +432,7 @@ fn validate_aligned_source<T: AlignedSbeSchema, S: ChunkSource>(
             pos += message_len;
             total += 1;
         }
-        start += u64::try_from(take).expect("chunk length fits u64");
+        start = start.saturating_add(widen(take));
     }
     Ok(total)
 }

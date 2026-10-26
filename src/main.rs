@@ -2,6 +2,8 @@
 
 mod cli;
 
+use std::io::Write;
+
 use anyhow::Context;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -44,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
             limit,
         } => {
             let summary = inspect::run(&input, &read_chunk_size, limit)?;
-            println!("{}", serde_json::to_string_pretty(&summary)?);
+            emit_json(&summary)?;
             Ok(())
         }
         Command::Verify {
@@ -52,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
             read_chunk_size,
         } => {
             let summary = verify::run(&input, &read_chunk_size)?;
-            println!("{}", serde_json::to_string_pretty(&summary)?);
+            emit_json(&summary)?;
             anyhow::ensure!(
                 summary.valid,
                 "capture verification failed: {} unknown message(s), {} delta(s) before a \
@@ -75,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
                 settings.collector.duration_secs
             };
             let report = latency::run(settings, max_markets, duration_secs, out.as_deref()).await?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            emit_json(&report)?;
             Ok(())
         }
         Command::Discover { out } => {
@@ -94,10 +96,21 @@ async fn main() -> anyhow::Result<()> {
             if let Some(path) = out.as_deref() {
                 write_json_atomic(path, &result).context("writing discovery output")?;
             }
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            emit_json(&result)?;
             Ok(())
         }
     }
+}
+
+/// Emit a JSON command result without panicking on a broken pipe.
+fn emit_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    serde_json::to_writer_pretty(&mut output, value).context("serializing JSON command output")?;
+    output
+        .write_all(b"\n")
+        .context("writing JSON command output")?;
+    output.flush().context("flushing JSON command output")
 }
 
 fn init_tracing(json: bool) -> anyhow::Result<()> {

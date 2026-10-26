@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::{
     Side,
@@ -633,7 +633,10 @@ impl CollectorCore {
         }
 
         {
-            let source_book = state.books.get_mut(&source).expect("source book exists");
+            let Some(source_book) = state.books.get_mut(&source) else {
+                error!(%source, native, "source book vanished while applying a snapshot");
+                return Vec::new();
+            };
             source_book.book = book;
             source_book.valid = true;
             // A snapshot establishes the complete clock state. Retaining an

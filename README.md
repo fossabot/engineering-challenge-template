@@ -52,10 +52,11 @@ cargo test --doc --locked
 cargo build --release --locked
 ```
 
-This branch's most recent run has **181 passing offline tests**: 169 library
-tests, 8 mock-exchange end-to-end tests, 2 replay integration tests, 2 opt-in
-scale tests (1k/5k/25k/100k), plus 2 opt-in live tests. The branch's commands,
-counts, and CI/live run links are recorded in
+The most recent local offline run has **185 passing tests and 3 ignored
+opt-in tests**: 175 library tests, 8 mock-exchange end-to-end tests, and 2
+replay integration tests. The ignored tests are one parameterized scale
+scenario (run separately at 1k/5k/25k/100k symbols) and two public-feed live
+tests. The branch's commands, counts, and CI/live run links are recorded in
 [`docs/correctness-audit-2026-10-26.md`](docs/correctness-audit-2026-10-26.md);
 the submitted baseline's 127-test run is recorded in
 [`docs/final-verification-2026-10-25.md`](docs/final-verification-2026-10-25.md).
