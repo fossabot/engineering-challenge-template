@@ -1,8 +1,8 @@
 # End-to-end architecture and traceability
 
-**Snapshot basis:** the uploaded source archive `engineering-challenge-phase2-2026-10-26.zip`, SHA-256 `1a8d6e3d7ba53e3369d3cbac854405d96451dfd4a00a1b274e39b9c17c51188d`. The archive has no `.git` directory, so it cannot be tied to a commit SHA or branch from its contents alone. This document maps that exact archived source tree, not an assumed current remote branch.
+**Snapshot basis:** the uploaded source archive `engineering-challenge-2026-10-26.zip`, SHA-256 `1a8d6e3d7ba53e3369d3cbac854405d96451dfd4a00a1b274e39b9c17c51188d`. The archive has no `.git` directory, so it cannot be tied to a commit SHA or branch from its contents alone. This document maps that exact archived source tree, not an assumed current remote branch.
 
-**Verification status: BLOCKED.** The tree contains integration inconsistencies that prevent these files from being treated as a verified runnable architecture. In particular, `src/metrics.rs` imports `crate::persistence::PersistenceStatus`, while `src/lib.rs` does not declare `persistence`; the coordinator also calls the newer metrics API with the old argument list. The `capacity.rs`, `catalog.rs`, and `persistence.rs` files are present but unreachable from either Rust crate root. The diagrams separate live wiring from these inactive Phase 2 source drafts. The Rust toolchain is unavailable in this review environment, so no `cargo test`, Clippy, or release build is claimed.
+**Verification status: BLOCKED.** The tree contains integration inconsistencies that prevent these files from being treated as a verified runnable architecture. In particular, `src/metrics.rs` imports `crate::persistence::PersistenceStatus`, while `src/lib.rs` does not declare `persistence`; the coordinator also calls the newer metrics API with the old argument list. The `capacity.rs`, `catalog.rs`, and `persistence.rs` files are present but unreachable from either Rust crate root. The diagrams separate live wiring from these inactive source drafts. The Rust toolchain is unavailable in this review environment, so no `cargo test`, Clippy, or release build is claimed.
 
 This is deliberately a set of linked views rather than one unreadable mega-graph. Arrows describe control or data flow; node labels name the implementation boundary. Source paths, test symbols, crate-root reachability, and known integration blockers make each material claim auditable. “Present in source” does not mean “compiled”, “called at runtime”, or “tested”.
 
@@ -53,7 +53,7 @@ flowchart LR
 
 **Data contracts.** Exchange-specific codecs map venue frames to normalized types in `model.rs`: `MarketInfo`, `ExchangeEvent`, `EventMeta`, `SourceId`, `Control`, and `OutputMessage`. `fixed.rs` and `side.rs` supply normalized price/side semantics; `orderbook.rs` implements the normalized book; generated SBE DTOs and the aligned reader/writer adapt the supplied schema.
 
-## 1.1. Phase 2 source-root reachability — active versus unintegrated files
+## 1.1. Source-root reachability — active versus unintegrated files
 
 ```mermaid
 flowchart LR
@@ -295,7 +295,7 @@ The test strategy has separate assurance planes:
 
 The runtime configuration is validated by `Settings::validate`; the important sizing relationship is `symbols_per_socket = ceil(discovered_symbols / shard_count)`, with both `max_symbols_per_socket` and `max_shards` enforced when automatic sharding is selected. Replica count multiplies source sockets: `total_source_connections = shard_count × replicas`. These are admission bounds, not evidence that the remote exchange accepts that many concurrent sockets.
 
-## 10. Implementation-to-evidence map and Phase 2 integration status
+## 10. Implementation-to-evidence map and integration status
 
 | Claim | Implementation anchor in this archive | Evidence symbol | Status / limit |
 |---|---|---|---|
@@ -312,7 +312,7 @@ The runtime configuration is validated by `Settings::validate`; the important si
 
 The generated inventories enumerate all source files and test-attributed functions, whether or not their containing module is reachable from a crate root. The inventory therefore includes draft tests that `cargo test` cannot discover until their modules are wired into the crate. Reachability is marked explicitly in both inventory files. A source inventory is not a passing-test report.
 
-## 13. Historical Phase 2 audit (superseded)
+## 13. Historical integration audit (superseded)
 
 The audit text below describes the pre-integration snapshot and is retained only
 as review history. It is not a statement of the current runtime: capacity,
@@ -329,7 +329,7 @@ The following source files are present in the tree and declared in `lib.rs`, but
 | `src/persistence.rs` | Latest-wins background writer for metadata/catalog; coalescing, non-blocking, failure handling, timestamp preservation | Declared in `lib.rs` but coordinator writes metadata directly via `MarketMetadata::write`; `PersistenceHandle` not used. |
 
 **Integration order (see audit):**
-1. Reconcile crate roots and APIs; decide whether to complete or remove the three Phase 2 draft modules.
+1. Reconcile crate roots and APIs; decide whether to complete or remove the three draft modules.
 2. Complete capacity dependencies. Add/validate the intended capacity settings, connect `capacity::plan` after discovery but before output files or source workers are created, and make the plan part of startup logs/reports. Test every ceiling at below/equal/above boundaries through an active Cargo target.
 3. Complete checkpoint dependencies. Provide a stable, tested checksum helper; wire `Catalog` load/save into a documented cold/warm/stale bootstrap policy; reject exchange mismatch, checksum mismatch, unsupported schema, and invalid age before subscribing.
 4. Connect the persistence worker. Publish immutable accepted catalog snapshots after complete discovery rounds, route metadata/catalog writes through `PersistenceHandle`, surface errors and timings into `RuntimeStatus`, and wait for final persistence during bounded shutdown.
@@ -357,7 +357,7 @@ The graph documents source-level topology, not a production certification, and t
 6. Existing capture paths can be truncated by `File::create`; output rotation/retention is not implemented in the writer.
 7. `docs/correctness-audit-2026-10-26.md`, `README.md`, generated inventories, and source files must not be combined into one test-count assertion until the commit/source snapshot is reconciled. This archive has no Git metadata; the static inventory finds 159 test-attributed function declarations, 15 of them inside three unrooted source files. This is not a count of passing tests.
 
-The Phase 2 drafts for capacity, catalog checkpointing, and background persistence should be integrated, compiled, tested, and called by the coordinator before diagrams describe them as runtime architecture. `metrics.rs` also needs to be reconciled with the coordinator's constructor/update calls and the module graph before `/readyz` can be claimed as functioning end to end.
+The drafts for capacity, catalog checkpointing, and background persistence should be integrated, compiled, tested, and called by the coordinator before diagrams describe them as runtime architecture. `metrics.rs` also needs to be reconciled with the coordinator's constructor/update calls and the module graph before `/readyz` can be claimed as functioning end to end.
 
 ## 12. Keeping this architecture synchronized
 

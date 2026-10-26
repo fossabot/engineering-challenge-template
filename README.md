@@ -646,7 +646,7 @@ docs/
   architecture.md             source traceability matrix, Mermaid diagrams
   correctness-audit-2026-10-26.md  test counts, CI run links, evidence
   final-verification-2026-10-25.md baseline 127-test verification
-  integration-audit-2026-10-26.md  Phase 2 integration audit
+  integration-audit-2026-10-26.md  integration audit
   latency.md                  Extension 4 methodology, caveats, raw data
   metric-runbook.md           alert signals and first diagnostic step per metric
   operating-envelope.md       planning bounds, derived shard count, defaults

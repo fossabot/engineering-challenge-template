@@ -236,7 +236,7 @@ with the next full snapshot (`src/verify.rs`).
 | `cargo test --doc --locked` | Pass: 0 documentation tests |
 | `cargo build --release --locked` | Pass |
 
-## Phase 1 exit: invariant-to-evidence map
+## Invariant-to-evidence map
 
 | Invariant | Evidence |
 |---|---|
@@ -254,10 +254,10 @@ with the next full snapshot (`src/verify.rs`).
 | Retirement boundaries do not fail verification | `empty_snapshot_is_a_retirement_boundary_not_a_mismatch`, E2E discovery churn |
 
 Open proof obligations: Q6 (venue-side transient omission), V-1 (external
-message-count check), V-2 (inherent self-consistency limit). Phase 2 (fault
-injection at the transport and discovery boundaries) starts from this branch.
+message-count check), V-2 (inherent self-consistency limit). Further hardening
+(fault injection at the transport and discovery boundaries) starts from this branch.
 
-## Phase 2: session, sharding, and timestamp hardening
+## Session, sharding, and timestamp hardening
 
 The second review pass raised seven findings against the baseline. Each is
 recorded here with its disposition on this branch. Severity scale: high,
@@ -408,9 +408,9 @@ moderate, low. The baseline commit `d4ab66d` is unchanged.
   exact error variant (`DuplicateLevel` for duplicate asks,
   `NegativeQuantity` for a negative level).
 - The health payload test now also covers every source failing (degraded,
-  never ok); the readiness policy was already recorded in Phase 1.
+  never ok); the readiness policy was already recorded.
 
-## Phase 2 verification on this branch
+## Verification on this branch
 
 | Gate | Result |
 |---|---|

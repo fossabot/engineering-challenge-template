@@ -1,13 +1,13 @@
-# Phase 2 architecture integration audit — 2026-10-26
+# Architecture integration audit — 2026-10-26
 ## Scope and disposition
 
-Audited input: `engineering-challenge-phase2-2026-10-26.zip`, SHA-256:
+Audited input: `engineering-challenge-2026-10-26.zip`, SHA-256:
 
 `1a8d6e3d7ba53e3369d3cbac854405d96451dfd4a00a1b274e39b9c17c51188d`
 
 The ZIP contains no `.git` directory. Findings are tied to this exact source snapshot, not to a remote branch tip or a commit. **Disposition (at time of audit): integration blocked; do not describe the archive as a verified build or a production-ready runtime.** This review environment has Python 3 and Node.js, but no `cargo` or `rustc`; no Rust build/test result is claimed.
 
-> **Note (2026-10-27):** The current codebase in this repository has since integrated the three Phase 2 draft modules (`capacity`, `catalog`, `persistence`). They are now declared in `src/lib.rs`, wired into the coordinator, and all tests pass (185 passing, 3 ignored). The architecture gate (`scripts/check_architecture.py --check`) passes. The findings below describe the state of the audited ZIP snapshot only and do not reflect the current repository state.
+> **Note (2026-10-27):** The current codebase in this repository has since integrated the three draft modules (`capacity`, `catalog`, `persistence`). They are now declared in `src/lib.rs`, wired into the coordinator, and all tests pass (185 passing, 3 ignored). The architecture gate (`scripts/check_architecture.py --check`) passes. The findings below describe the state of the audited ZIP snapshot only and do not reflect the current repository state.
 
 ## Findings
 
@@ -65,7 +65,7 @@ After regeneration, the static inventory records 159 test-attributed function de
 
 ## Required integration order
 
-1. **Reconcile crate roots and APIs.** Decide whether to complete or remove the three Phase 2 draft modules. If completing them, expose the modules in the appropriate crate root and resolve the `MetricsRegistry` constructor/update API mismatch first.
+1. **Reconcile crate roots and APIs.** Decide whether to complete or remove the three draft modules. If completing them, expose the modules in the appropriate crate root and resolve the `MetricsRegistry` constructor/update API mismatch first.
 2. **Complete capacity dependencies.** Add/validate the intended capacity settings, connect `capacity::plan` after discovery but before output files or source workers are created, and make the plan part of startup logs/reports. Test every ceiling at below/equal/above boundaries through an active Cargo target.
 3. **Complete checkpoint dependencies.** Provide a stable, tested checksum helper; wire `Catalog` load/save into a documented cold/warm/stale bootstrap policy; reject exchange mismatch, checksum mismatch, unsupported schema, and invalid age before subscribing.
 4. **Connect the persistence worker.** Publish immutable accepted catalog snapshots after complete discovery rounds, route metadata/catalog writes through `PersistenceHandle`, surface errors and timings into `RuntimeStatus`, and wait for final persistence during bounded shutdown.
