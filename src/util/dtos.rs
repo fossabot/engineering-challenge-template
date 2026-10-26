@@ -15,7 +15,14 @@ macro_rules! schemas {
                 unused_comparisons,
                 unused_unsafe,
                 unsafe_code,
-                clippy::all
+                clippy::all,
+                clippy::unwrap_used,
+                clippy::expect_used,
+                clippy::panic,
+                clippy::todo,
+                clippy::unimplemented,
+                clippy::dbg_macro,
+                clippy::print_stdout,
             )]
             include!(concat!(env!("OUT_DIR"), "/", stringify!($schema), ".rs"));
         }

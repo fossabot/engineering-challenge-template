@@ -4,6 +4,13 @@
 //! third-party network. Run it explicitly with:
 //! `RUN_LIVE_TESTS=1 cargo test --test live_polymarket -- --ignored --nocapture`
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout
+)]
+
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use engineering_challenge::{

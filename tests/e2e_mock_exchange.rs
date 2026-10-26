@@ -9,6 +9,13 @@
 //! completeness under these scenarios is the mock exchange's full delivered
 //! update history plus the snapshots it sent at recovery boundaries.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout
+)]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,

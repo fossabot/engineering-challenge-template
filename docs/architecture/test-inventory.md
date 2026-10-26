@@ -182,16 +182,16 @@ This is source inventory, not a claim that tests passed or that a build succeede
 | `src/ws.rs` | `ephemeral_ports_ignore_the_ordinal` | `test (line 396)` | crate-root reachable |
 | `src/ws.rs` | `pinned_source_ports_are_derived_per_connection` | `test (line 374)` | crate-root reachable |
 | `src/ws.rs` | `stalled_handshake_is_bounded_by_the_connect_timeout` | `tokio::test (line 300)` | crate-root reachable |
-| `tests/e2e_mock_exchange.rs` | `discovery_churn_retires_and_adds_symbols` | `tokio::test(flavor = "multi_thread", worker_threads = 2) (line 1386)` | integration-test target |
-| `tests/e2e_mock_exchange.rs` | `full_outage_recovery_exposes_the_uncovered_interval` | `tokio::test(flavor = "multi_thread", worker_threads = 2) (line 1318)` | integration-test target |
-| `tests/e2e_mock_exchange.rs` | `mock_subscription_scale_across_shards` | `tokio::test(flavor = "multi_thread", worker_threads = 2) (line 1621)` | integration-test target |
-| `tests/e2e_mock_exchange.rs` | `negative_control_missing_update_is_detected_by_verify` | `tokio::test(flavor = "multi_thread", worker_threads = 2) (line 1563)` | integration-test target |
-| `tests/e2e_mock_exchange.rs` | `opt_in_scale_run` | `tokio::test(flavor = "multi_thread", worker_threads = 4) (line 1794)` | integration-test target |
-| `tests/e2e_mock_exchange.rs` | `rotation_produces_a_complete_manifest_and_readable_segments` | `tokio::test(flavor = "multi_thread", worker_threads = 2) (line 1725)` | integration-test target |
-| `tests/e2e_mock_exchange.rs` | `silent_subscription_is_detected_and_repaired` | `tokio::test(flavor = "multi_thread", worker_threads = 2) (line 1481)` | integration-test target |
-| `tests/e2e_mock_exchange.rs` | `single_socket_loss_fails_over_and_emits_anchoring_snapshot` | `tokio::test(flavor = "multi_thread", worker_threads = 2) (line 1260)` | integration-test target |
-| `tests/e2e_mock_exchange.rs` | `steady_state_history_matches_mock_exchange_truth` | `tokio::test(flavor = "multi_thread", worker_threads = 2) (line 1201)` | integration-test target |
-| `tests/live_polymarket.rs` | `discovers_and_subscribes_to_public_polymarket_books` | `tokio::test (line 16)` | integration-test target |
-| `tests/live_polymarket.rs` | `resubscribing_an_asset_returns_a_fresh_book` | `tokio::test (line 80)` | integration-test target |
-| `tests/replay_fixture.rs` | `replay_rejects_out_of_range_timestamps_before_serialization` | `test (line 37)` | integration-test target |
-| `tests/replay_fixture.rs` | `sample_fixture_replays_through_the_same_core_and_decodes` | `test (line 9)` | integration-test target |
+| `tests/e2e_mock_exchange.rs` | `discovery_churn_retires_and_adds_symbols` | `tokio::test(flavor = "multi_thread", worker_threads = 2) (line 1393)` | integration-test target |
+| `tests/e2e_mock_exchange.rs` | `full_outage_recovery_exposes_the_uncovered_interval` | `tokio::test(flavor = "multi_thread", worker_threads = 2) (line 1325)` | integration-test target |
+| `tests/e2e_mock_exchange.rs` | `mock_subscription_scale_across_shards` | `tokio::test(flavor = "multi_thread", worker_threads = 2) (line 1628)` | integration-test target |
+| `tests/e2e_mock_exchange.rs` | `negative_control_missing_update_is_detected_by_verify` | `tokio::test(flavor = "multi_thread", worker_threads = 2) (line 1570)` | integration-test target |
+| `tests/e2e_mock_exchange.rs` | `opt_in_scale_run` | `tokio::test(flavor = "multi_thread", worker_threads = 4) (line 1801)` | integration-test target |
+| `tests/e2e_mock_exchange.rs` | `rotation_produces_a_complete_manifest_and_readable_segments` | `tokio::test(flavor = "multi_thread", worker_threads = 2) (line 1732)` | integration-test target |
+| `tests/e2e_mock_exchange.rs` | `silent_subscription_is_detected_and_repaired` | `tokio::test(flavor = "multi_thread", worker_threads = 2) (line 1488)` | integration-test target |
+| `tests/e2e_mock_exchange.rs` | `single_socket_loss_fails_over_and_emits_anchoring_snapshot` | `tokio::test(flavor = "multi_thread", worker_threads = 2) (line 1267)` | integration-test target |
+| `tests/e2e_mock_exchange.rs` | `steady_state_history_matches_mock_exchange_truth` | `tokio::test(flavor = "multi_thread", worker_threads = 2) (line 1208)` | integration-test target |
+| `tests/live_polymarket.rs` | `discovers_and_subscribes_to_public_polymarket_books` | `tokio::test (line 23)` | integration-test target |
+| `tests/live_polymarket.rs` | `resubscribing_an_asset_returns_a_fresh_book` | `tokio::test (line 87)` | integration-test target |
+| `tests/replay_fixture.rs` | `replay_rejects_out_of_range_timestamps_before_serialization` | `test (line 44)` | integration-test target |
+| `tests/replay_fixture.rs` | `sample_fixture_replays_through_the_same_core_and_decodes` | `test (line 16)` | integration-test target |

@@ -5,7 +5,9 @@ Audited input: `engineering-challenge-phase2-2026-10-26.zip`, SHA-256:
 
 `1a8d6e3d7ba53e3369d3cbac854405d96451dfd4a00a1b274e39b9c17c51188d`
 
-The ZIP contains no `.git` directory. Findings are tied to this exact source snapshot, not to a remote branch tip or a commit. **Disposition: integration blocked; do not describe the archive as a verified build or a production-ready runtime.** This review environment has Python 3 and Node.js, but no `cargo` or `rustc`; no Rust build/test result is claimed.
+The ZIP contains no `.git` directory. Findings are tied to this exact source snapshot, not to a remote branch tip or a commit. **Disposition (at time of audit): integration blocked; do not describe the archive as a verified build or a production-ready runtime.** This review environment has Python 3 and Node.js, but no `cargo` or `rustc`; no Rust build/test result is claimed.
+
+> **Note (2026-10-27):** The current codebase in this repository has since integrated the three Phase 2 draft modules (`capacity`, `catalog`, `persistence`). They are now declared in `src/lib.rs`, wired into the coordinator, and all tests pass (185 passing, 3 ignored). The architecture gate (`scripts/check_architecture.py --check`) passes. The findings below describe the state of the audited ZIP snapshot only and do not reflect the current repository state.
 
 ## Findings
 

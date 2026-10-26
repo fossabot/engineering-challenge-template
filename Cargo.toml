@@ -50,3 +50,12 @@ panic = "abort"
 # isolated, build-generated module with its own `allow(unsafe_code)`; all
 # hand-written project code is still denied.
 unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"

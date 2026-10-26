@@ -1,5 +1,7 @@
 //! Build helpers to auto-generate the rust code for the SBE schemas.
 
+#![allow(clippy::print_stdout)]
+
 pub mod sbe_yaml;
 
 use std::fs;
